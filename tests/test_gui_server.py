@@ -103,3 +103,30 @@ def test_browse_and_errors(server, dataset_file):
     with pytest.raises(urllib.error.HTTPError) as exc:
         get(base + "/nonexistent.js")
     assert exc.value.code == 404
+
+
+def test_boundary_endpoints(server):
+    base, service = server
+    body, _ = get(base + "/api/boundary/edges?m=5")
+    nb, m, n = np.frombuffer(body[:12], dtype="<i4")
+    assert m == 5 and n == 6 and nb == 2 * 12  # inner + outer circle of the 2 x 12 annulus
+    off = 12
+    ids = np.frombuffer(body[off : off + nb * 8], dtype="<i4").reshape(nb, 2)
+    off += nb * 8
+    coords = np.frombuffer(body[off : off + nb * m * 8], dtype="<f4").reshape(nb, m, 2)
+    off += nb * m * 8
+    nodes = np.frombuffer(body[off : off + nb * n * 8], dtype="<f4").reshape(nb, n, 2)
+    off += nb * n * 8
+    normals = np.frombuffer(body[off:], dtype="<f4").reshape(nb, n, 2)
+    r = np.hypot(coords[..., 0], coords[..., 1])
+    assert np.allclose(np.sort(np.unique(np.round(r, 3))), [0.5, 1.5])
+    assert set(ids[:, 1].tolist()) == {1, 3}
+    # normals point away from the fluid: radially outward on the outer circle, towards the centre on the inner
+    rn = np.hypot(nodes[..., 0], nodes[..., 1])
+    radial = nodes / rn[..., None]
+    dots = np.sum(normals * radial, axis=-1)
+    assert np.allclose(dots[rn > 1], 1.0, atol=1e-5) and np.allclose(dots[rn < 1], -1.0, atol=1e-5)
+    det = json.loads(get(base + "/api/boundary/detect?angle=90")[0])
+    assert len(det["groups"]) == 2 and all(g["closed"] for g in det["groups"])
+    assert sorted(len(g["edges"]) for g in det["groups"]) == [12, 12]
+    assert all(0 <= i < nb for g in det["groups"] for i in g["edges"])

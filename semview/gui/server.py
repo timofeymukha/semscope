@@ -27,7 +27,9 @@ import numpy as np
 
 from .. import mpi
 from .. import spectral as sp
+from ..boundary import detect_boundaries, edge_nodes, edge_normals
 from ..dataset import Dataset, SEMData2D
+from ..session import SESSION_SUFFIX, load_session, save_session
 
 __all__ = ["serve", "DataService", "worker_loop"]
 
@@ -65,6 +67,8 @@ class DataService:
         self.path: str | None = None
         self._gathered: dict[int, SEMData2D] = {}
         self._gather_order: list[int] = []
+        self.session: dict | None = None   # session the front-end should apply
+        self._boundary = None              # cached external edges of the open mesh
         self.max_cached = 16
         self.max_cached_bytes = 4 << 30
 
@@ -73,15 +77,28 @@ class DataService:
         if self.comm.Get_size() > 1:
             self.comm.bcast(cmd, root=0)
 
-    def open(self, path: str):
+    def open(self, path: str, session: dict | None = None):
+        if path.endswith(SESSION_SUFFIX):
+            return self.open_session(path)
         with self.lock:
-            self._bcast(("open", path))
-            self.ds = Dataset(path, comm=self.comm)
-            self.path = path
-            self._gathered.clear()
-            self._gather_order.clear()
-            self.step(0)
+            if os.path.abspath(path) != (os.path.abspath(self.path) if self.path else None):
+                self._bcast(("open", path))
+                self.ds = Dataset(path, comm=self.comm)
+                self.path = path
+                self._gathered.clear()
+                self._gather_order.clear()
+                self._boundary = None
+                self.step(0)
+            self.session = session
         return self.state()
+
+    def open_session(self, path: str):
+        """Open the dataset referenced by a session file and hand the session to the front-end."""
+        sess = load_session(path)
+        return self.open(sess["dataset"]["path"], session=sess)
+
+    def save_session(self, path: str, session: dict, overwrite: bool) -> str:
+        return save_session(path, session, overwrite=overwrite)
 
     def step(self, i: int) -> SEMData2D:
         """Return step ``i`` gathered on rank 0 (call with the lock held or from ``open``)."""
@@ -131,6 +148,7 @@ class DataService:
             "bary": sp.barycentric_weights(sp.gll_nodes(d0.n)).tolist(),
             "mpi_ranks": self.comm.Get_size(),
             "cwd": os.getcwd(),
+            "session": self.session,
         }
 
     def mesh_bytes(self) -> bytes:
@@ -152,6 +170,41 @@ class DataService:
         finite = arr[np.isfinite(arr)]
         lo, hi = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
         return np.ascontiguousarray(arr, dtype="<f4").tobytes(), {"time": d.time, "min": lo, "max": hi}
+
+    # ------------------------------------------------------------ boundaries
+    def _external(self):
+        if self._boundary is None:
+            d = self.get_step(0)
+            ext = d.external_edges()
+            self._boundary = {"edges": ext, "index": {(int(e), int(s)): i for i, (e, s) in enumerate(ext)}}
+        return self._boundary
+
+    def boundary_edges_bytes(self, m: int = 16) -> bytes:
+        """Binary description of the external edges.
+
+        Layout: int32 ``(nb, m, n)``; int32 ``(elem, side) * nb``; float32 polyline
+        ``(x, y) * m * nb`` (spectrally resampled); float32 GLL nodes ``(x, y) * n * nb``;
+        float32 outward unit normals ``(nx, ny) * n * nb`` at those nodes.
+        """
+        d = self.get_step(0)
+        ext = self._external()["edges"]
+        m = max(2, int(m))
+        xe, ye = edge_nodes(d.x, d.y, ext[:, 0], ext[:, 1])
+        J = sp.interpolation_matrix(sp.gll_nodes(d.n), sp.uniform_nodes(m))
+        coords = np.stack([xe @ J.T, ye @ J.T], axis=-1).astype("<f4")
+        nodes = np.stack([xe, ye], axis=-1).astype("<f4")
+        normals = edge_normals(d.x, d.y, ext).astype("<f4") if len(ext) else np.zeros((0, d.n, 2), "<f4")
+        head = np.array([len(ext), m, d.n], dtype="<i4").tobytes()
+        return head + np.ascontiguousarray(ext, dtype="<i4").tobytes() + coords.tobytes() + nodes.tobytes() + normals.tobytes()
+
+    def boundary_detect(self, angle: float) -> dict:
+        d = self.get_step(0)
+        b = self._external()
+        groups = detect_boundaries(d.x, d.y, angle=angle, edges=b["edges"])
+        return {
+            "angle": angle,
+            "groups": [{"name": g.name, "closed": g.closed, "edges": [b["index"][(int(e), int(s_))] for e, s_ in g.edges]} for g in groups],
+        }
 
     def probe(self, x: float, y: float, step: int, names: list[str]) -> dict:
         d = self.get_step(step)
@@ -202,11 +255,13 @@ def browse(directory: str) -> dict:
         full = os.path.join(directory, nm)
         if os.path.isdir(full):
             entries.append({"name": nm, "type": "dir"})
+        elif nm.endswith(SESSION_SUFFIX):
+            entries.append({"name": nm, "type": "session", "size": os.path.getsize(full)})
         elif nm.endswith(".nek5000"):
             entries.append({"name": nm, "type": "meta", "size": os.path.getsize(full)})
         elif _STEP_FILE.match(nm):
             entries.append({"name": nm, "type": "step", "size": os.path.getsize(full)})
-    entries.sort(key=lambda e: ({"dir": 0, "meta": 1, "step": 2}[e["type"]], e["name"].lower()))
+    entries.sort(key=lambda e: ({"dir": 0, "session": 1, "meta": 2, "step": 3}[e["type"]], e["name"].lower()))
     return {"dir": directory, "parent": os.path.dirname(directory), "entries": entries}
 
 
@@ -257,6 +312,31 @@ def make_handler(service: DataService):
                 traceback.print_exc()
                 self._error(500, f"{type(exc).__name__}: {exc}")
 
+        def do_POST(self):  # noqa: N802
+            url = urlparse(self.path)
+            q = {k: v[0] for k, v in parse_qs(url.query).items()}
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if url.path == "/api/session/save":
+                    try:
+                        out = service.save_session(q["path"], body, overwrite=q.get("overwrite", "0") == "1")
+                    except FileExistsError as exc:
+                        self._json({"error": f"{exc} exists", "exists": True}, 409)
+                        return
+                    self._json({"ok": True, "path": out})
+                else:
+                    raise FileNotFoundError(url.path)
+            except FileNotFoundError as exc:
+                self._error(404, str(exc))
+            except (KeyError, ValueError, OSError) as exc:
+                self._error(400, f"{type(exc).__name__}: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                import traceback
+
+                traceback.print_exc()
+                self._error(500, f"{type(exc).__name__}: {exc}")
+
         def static(self, path: str):
             if path in ("/", ""):
                 path = "/index.html"
@@ -274,6 +354,8 @@ def make_handler(service: DataService):
                 self._json(service.state())
             elif route == "open":
                 self._json(service.open(q["path"]))
+            elif route == "session/load":
+                self._json(service.open_session(q["path"]))
             elif route == "browse":
                 self._json(browse(q.get("dir", "")))
             elif route == "colormaps":
@@ -285,6 +367,10 @@ def make_handler(service: DataService):
             elif route == "field":
                 data, meta = service.field(q["name"], int(q.get("step", 0)))
                 self._send(200, data, "application/octet-stream", {"X-Time": repr(meta["time"]), "X-Min": repr(meta["min"]), "X-Max": repr(meta["max"])})
+            elif route == "boundary/edges":
+                self._send(200, service.boundary_edges_bytes(int(q.get("m", 16))), "application/octet-stream")
+            elif route == "boundary/detect":
+                self._json(service.boundary_detect(float(q.get("angle", 90))))
             elif route == "probe":
                 names = [s for s in q.get("fields", "").split(",") if s]
                 self._json(service.probe(float(q["x"]), float(q["y"]), int(q.get("step", 0)), names))
@@ -324,7 +410,7 @@ def serve(path: str | None = None, port: int = 8765, host: str = "127.0.0.1", op
         return None
     service = DataService(comm)
     if path:
-        service.open(path)
+        service.open(path)   # a dataset or a *.semview.json session file
     httpd = ThreadingHTTPServer((host, port), make_handler(service))
     httpd.daemon_threads = True
     url = f"http://{host}:{httpd.server_address[1]}/"

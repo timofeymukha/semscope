@@ -1,6 +1,6 @@
 // semview GUI application: data loading, view control, overlays, probes.
 import { Renderer } from './renderer.js';
-import { Spectral } from './spectral.js';
+import { Spectral, basis } from './spectral.js';
 
 const $ = id => document.getElementById(id);
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -21,7 +21,7 @@ const S = {
   colormaps: {},
   range: { auto: true, sym: false, lo: 0, hi: 1 },
   invert: false,
-  mode: 0,
+  mode: 1,                 // 1 = nodal/linear (fast default), 0 = spectral (exact per pixel)
   edges: true, edgeWidth: 1,
   contours: false, nContours: 12,
   nodes: false, nodeSize: 3,
@@ -35,6 +35,8 @@ const S = {
   spectral: null,
   probePinned: null,       // {x, y}
   lines: [],               // line probes, see the line probe section
+  boundaries: [],          // boundary definitions, see the boundaries section
+  showBoundaries: true,
   snapAngle: false,
   drag: null,
   hover: null,
@@ -107,7 +109,8 @@ function frame() {
 requestAnimationFrame(frame);
 
 function updateStatus(dt) {
-  if (!S.meta) { $('status').textContent = ''; return; }
+  if (!S.meta) { $('status').textContent = ''; $('topbar-title').textContent = ''; return; }
+  $('topbar-title').textContent = S.meta.open ? `${S.meta.path.split('/').pop()} · ${S.field}` + (S.current ? ` · t = ${fmt(S.current.time, 6)}` : '') : '';
   const st = R.stats;
   $('status').textContent = `${st.visible.toLocaleString()} / ${S.meta.nelv.toLocaleString()} elements · ${(st.triangles / 1000).toFixed(0)}k tris · ${dt.toFixed(1)} ms` + (S.meta.mpi_ranks > 1 ? ` · ${S.meta.mpi_ranks} MPI ranks` : '');
 }
@@ -151,6 +154,7 @@ async function loadState() {
   setupTime();
   fitView();
   await loadField();
+  if (S.meta.session) await applySession(S.meta.session);
 }
 
 async function loadMesh() {
@@ -325,7 +329,7 @@ function drawOverlay() {
     octx.fillText(S.field, 18, 14);
     octx.font = '11px ui-monospace, Menlo, Consolas, monospace';
     octx.fillStyle = dim;
-    octx.fillText(`t = ${fmt(S.current.time, 6)}` + (S.meta.nsteps > 1 ? `   step ${S.step}` : '') + (S.mode === 1 ? '   [nodal / linear]' : ''), 18, 32);
+    octx.fillText(`t = ${fmt(S.current.time, 6)}` + (S.meta.nsteps > 1 ? `   step ${S.step}` : '') + (S.mode === 1 ? '   [nodal / linear]' : '   [spectral]'), 18, 32);
   }
   // pinned probe
   if (S.probePinned) {
@@ -334,6 +338,8 @@ function drawOverlay() {
     octx.beginPath(); octx.arc(px, py, 6, 0, 2 * Math.PI); octx.stroke();
     octx.beginPath(); octx.moveTo(px - 10, py); octx.lineTo(px + 10, py); octx.moveTo(px, py - 10); octx.lineTo(px, py + 10); octx.stroke();
   }
+  drawBoundaries();
+  drawNormalPreview();
   // line probes: solid segment with end-point handles; when the chart is zoomed
   // along the distance axis, a translucent halo marks the part it shows
   const T = S.lines.length ? themeColors() : null;
@@ -363,7 +369,7 @@ function drawOverlay() {
     }
     if (isActive) {   // label near the start point
       octx.fillStyle = lc; octx.font = '600 11px -apple-system, Segoe UI, Inter, Roboto, sans-serif'; octx.textAlign = 'left'; octx.textBaseline = 'bottom';
-      octx.fillText(`L${L.id}`, ax + 7, ay - 6);
+      octx.fillText(`${lineName(L)}`, ax + 7, ay - 6);
       octx.font = '11px ui-monospace, Menlo, Consolas, monospace';
     }
     if (L.hoverIdx != null && L.data && L.visible) {
@@ -377,6 +383,7 @@ function drawOverlay() {
 // ----------------------------------------------------------------- probe
 function probeAt(px, py) {
   if (!S.mesh || !S.current) return null;
+  R.setView(S.view);   // the pick buffer must use the current view, not the last rendered one
   const e = R.pickElement(px, py, S.pxPerCell);
   if (e < 0) return null;
   const [x, y] = screenToData(px, py);
@@ -392,7 +399,7 @@ function showProbe(p) {
   const el = $('probe');
   if (!p) { el.textContent = '—'; el.classList.add('muted'); return; }
   el.classList.remove('muted');
-  el.textContent = `x = ${fmt(p.x, 6)}   y = ${fmt(p.y, 6)}\nelement ${p.gid}  (local ${p.e})\n(r, s) = (${fmt(p.r, 4)}, ${fmt(p.s, 4)})\n${S.field} = ${fmt(p.v, 7)}${p.ok ? '' : '   (inversion not converged)'}`;
+  el.textContent = `x = ${fmt(p.x, 6)}   y = ${fmt(p.y, 6)}\nelement ${p.gid}  (local ${p.e})\n${S.field} = ${fmt(p.v, 7)}${p.ok ? '' : '   (inversion not converged)'}`;
 }
 
 function updateProbe() {
@@ -405,8 +412,9 @@ function updateProbe() {
 // probe and the view.  Settings (field, colormap, ...) are not part of it.
 const HIST = { undo: [], redo: [], max: 200, lastViewPush: 0 };
 const cloneLine = L => ({ ...L, hoverIdx: null });   // sampled data is immutable and shared
+const cloneBoundary = b => ({ ...b, edges: b.edges.slice() });
 function snapshot() {
-  return { lines: S.lines.map(cloneLine), active: LP.active, pinned: S.probePinned ? { ...S.probePinned } : null, view: { ...S.view } };
+  return { lines: S.lines.map(cloneLine), active: LP.active, pinned: S.probePinned ? { ...S.probePinned } : null, view: { ...S.view }, boundaries: S.boundaries.map(cloneBoundary), editing: BD.editing ? BD.editing.id : null };
 }
 function pushHistory(label, snap = snapshot()) {
   HIST.undo.push({ label, snap });
@@ -428,9 +436,14 @@ function restore(snap) {
   LP.nextId = Math.max(LP.nextId, ...S.lines.map(L => L.id + 1));
   S.probePinned = snap.pinned ? { ...snap.pinned } : null;
   S.view = { ...snap.view };
+  S.boundaries = (snap.boundaries || []).map(cloneBoundary);
+  BD.nextId = Math.max(BD.nextId, ...S.boundaries.map(b => b.id + 1));
+  BD.editing = BD.pick ? boundaryById(snap.editing) : null;
+  renderBoundaryList();
   if (S.drag && S.drag.kind !== 'pan') { S.drag = null; glCanvas.style.cursor = ''; }
   renderLegend();
-  if (S.lines.length) showLinePanel(); else { $('line-panel').hidden = true; LP.layout = null; }
+  showLinePanel();
+  if (!S.lines.length) LP.layout = null;
   drawLineChart();
   refreshLines();
   updateProbe();
@@ -458,10 +471,11 @@ function clearHistory() { HIST.undo = []; HIST.redo = []; HIST.lastViewPush = 0;
 // (spectral evaluation along the segment) and drawn in the shared chart.
 const LINE_COLORS_DARK = ['#ffd166', '#5cc8ff', '#ff7eb6', '#4ade80', '#c084fc', '#fb923c', '#f87171', '#22d3ee'];
 const LINE_COLORS_LIGHT = ['#c2410c', '#1d4ed8', '#be185d', '#15803d', '#7e22ce', '#b45309', '#b91c1c', '#0e7490'];
-const LP = { layout: null, drag: null, panelDrag: null, xview: null, yview: null, hoverS: null, active: null, nextId: 1, hoverHit: null, showGrid: true, showElem: true };
+const LP = { layout: null, drag: null, panelDrag: null, xview: null, yview: null, hoverS: null, active: null, nextId: 1, hoverHit: null, showGrid: true, showElem: true, windowOpen: false };
 const SNAP_DEG = 10;
 
 const lineColor = L => (isLight() ? LINE_COLORS_LIGHT : LINE_COLORS_DARK)[L.colorIdx % LINE_COLORS_DARK.length];
+const lineName = L => (L.kind === 'normal' ? 'N' : 'L') + L.id;
 const activeLine = () => S.lines.find(L => L.id === LP.active) || null;
 
 function themeColors() {
@@ -481,24 +495,24 @@ function newLine(x, y) {
   const used = new Set(S.lines.map(L => L.colorIdx));
   let colorIdx = 0;
   while (used.has(colorIdx) && colorIdx < LINE_COLORS_DARK.length) colorIdx++;
-  const L = { id: LP.nextId++, colorIdx, x0: x, y0: y, x1: x, y1: y, visible: true, data: null, field: null, step: null, hoverIdx: null, token: 0 };
+  const L = { id: LP.nextId++, colorIdx, kind: 'line', anchor: null, x0: x, y0: y, x1: x, y1: y, visible: true, data: null, field: null, step: null, hoverIdx: null, token: 0 };
   S.lines.push(L);
   LP.active = L.id;
   return L;
 }
 
 function removeLine(L, record = true) {
-  if (record) pushHistory(`delete L${L.id}`);
+  if (record) pushHistory(`delete ${lineName(L)}`);
   S.lines = S.lines.filter(o => o !== L);
   if (LP.active === L.id) LP.active = S.lines.length ? S.lines[S.lines.length - 1].id : null;
-  if (!S.lines.length) { $('line-panel').hidden = true; LP.xview = null; LP.yview = null; }
-  renderLegend(); drawLineChart(); requestRender();
+  if (!S.lines.length) { LP.xview = null; LP.yview = null; }
+  renderLegend(); showLinePanel(); drawLineChart(); requestRender();
 }
 
 function clearLines(record = true) {
   if (record && (S.lines.length || S.probePinned)) pushHistory('clear lines');
   S.lines = []; LP.active = null; LP.xview = null; LP.yview = null; LP.layout = null;
-  $('line-panel').hidden = true;
+  renderLegend(); showLinePanel(); drawLineChart();
   requestRender();
 }
 
@@ -539,8 +553,9 @@ function hitLine(px, py) {
 }
 
 function showDragInfo(L) {
+  renderLineList();
   $('probe').classList.remove('muted');
-  $('probe').textContent = `line L${L.id}: (${fmt(L.x0, 5)}, ${fmt(L.y0, 5)}) → (${fmt(L.x1, 5)}, ${fmt(L.y1, 5)})\nlength ${fmt(lineLength(L), 5)}   angle ${lineAngle(L).toFixed(1)}°`;
+  $('probe').textContent = `line ${lineName(L)}: (${fmt(L.x0, 5)}, ${fmt(L.y0, 5)}) → (${fmt(L.x1, 5)}, ${fmt(L.y1, 5)})\nlength ${fmt(lineLength(L), 5)}   angle ${lineAngle(L).toFixed(1)}°`;
 }
 
 async function runLine(L) {
@@ -557,19 +572,27 @@ async function runLine(L) {
 }
 function refreshLines() { for (const L of S.lines) if (!L.data || L.field !== S.field || L.step !== S.step) runLine(L); }
 
-function showLinePanel() {
+/** The line chart is a persistent window: closing it keeps the lines. */
+function setLineWindow(open) {
+  LP.windowOpen = !!open;
   const p = $('line-panel');
-  if (p.hidden) {
-    p.hidden = false;
+  p.hidden = !LP.windowOpen;
+  if (LP.windowOpen) {
     if (!p.style.left) {   // first time: bottom-right corner of the view
       const v = $('view').getBoundingClientRect();
       p.style.left = Math.max(8, v.width - p.offsetWidth - 14) + 'px';
       p.style.top = Math.max(8, v.height - p.offsetHeight - 14) + 'px';
     }
     clampPanel();
+    renderLegend();
+    showLinePanel();
+    drawLineChart();
   }
+  requestRender();
+}
+function showLinePanel() {
   const n = S.lines.filter(L => L.visible).length;
-  $('lp-title').textContent = `${S.field} along ${S.lines.length} line${S.lines.length === 1 ? '' : 's'}` + (n !== S.lines.length ? ` (${n} shown)` : '');
+  $('lp-title').textContent = S.lines.length ? `${S.field} along ${S.lines.length} line${S.lines.length === 1 ? '' : 's'}` + (n !== S.lines.length ? ` (${n} shown)` : '') : 'line chart — no lines yet (Shift-drag on the plot)';
 }
 
 function clampPanel() {
@@ -579,7 +602,52 @@ function clampPanel() {
   p.style.left = left + 'px'; p.style.top = top + 'px';
 }
 
+/** Sidebar registry of the line probes: visibility, selection, editable end points. */
+function renderLineList() {
+  const box = $('line-list');
+  box.innerHTML = '';
+  for (const L of S.lines) {
+    const item = document.createElement('div');
+    item.className = 'line-item' + (L.id === LP.active ? ' active' : '') + (L.visible ? '' : ' hidden-line');
+    const head = document.createElement('div'); head.className = 'head';
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = L.visible; cb.title = 'show / hide in the chart';
+    cb.onchange = () => { pushHistory(`${cb.checked ? 'show' : 'hide'} ${lineName(L)}`); L.visible = cb.checked; renderLegend(); showLinePanel(); drawLineChart(); requestRender(); };
+    const sw = document.createElement('i'); sw.className = 'swatch'; sw.style.background = lineColor(L);
+    const nm = document.createElement('span'); nm.className = 'name'; nm.textContent = `${lineName(L)}`; nm.title = 'select';
+    nm.onclick = () => { LP.active = L.id; renderLegend(); drawLineChart(); requestRender(); };
+    const len = document.createElement('span'); len.className = 'len'; len.textContent = `${fmt(lineLength(L), 4)} · ${lineAngle(L).toFixed(1)}°`;
+    if (L.kind === 'normal' && L.anchor) { len.title = `wall-normal from element ${S.mesh ? S.mesh.elmap[L.anchor.elem] : L.anchor.elem}, ${['bottom', 'right', 'top', 'left'][L.anchor.side]} side, ${L.anchor.node !== null && L.anchor.node !== undefined ? `node ${L.anchor.node}` : `t = ${fmt(L.anchor.t, 4)}`}`; len.textContent = `⊥ ${len.textContent}`; }
+    const x = document.createElement('button'); x.className = 'x'; x.textContent = '✕'; x.title = 'delete';
+    x.onclick = () => removeLine(L);
+    head.append(cb, sw, nm, len, x);
+    const grid = document.createElement('div'); grid.className = 'coords';
+    const field = (key, value) => {
+      const inp = document.createElement('input'); inp.type = 'text'; inp.className = 'mono'; inp.value = fmt(value, 6); inp.title = key;
+      inp.onkeydown = ev => { ev.stopPropagation(); if (ev.key === 'Enter') inp.blur(); if (ev.key === 'Escape') { inp.value = fmt(L[key], 6); inp.blur(); } };
+      inp.onchange = () => {
+        const v = parseFloat(inp.value);
+        if (!Number.isFinite(v)) { inp.value = fmt(L[key], 6); return; }
+        if (v === L[key]) return;
+        pushHistory(`move ${lineName(L)}`);
+        if (L.kind === 'normal' && L.anchor && BD.ext) {
+          const want = { x0: L.x0, y0: L.y0, x1: L.x1, y1: L.y1 }; want[key] = v;
+          if (key === 'x1' || key === 'y1') setNormalLength(L, want.x1, want.y1);
+          else { const h = boundaryPointAt(...dataToScreen(want.x0, want.y0), allowedEdgesFor(L), NL.snap, 1e9); if (h) setNormalOrigin(L, h); }
+        } else L[key] = v;
+        LP.xview = null; LP.yview = null;
+        renderLineList(); runLine(L); requestRender();
+      };
+      return inp;
+    };
+    const lab = t => { const e = document.createElement('span'); e.textContent = t; return e; };
+    grid.append(lab('from'), field('x0', L.x0), field('y0', L.y0), lab('to'), field('x1', L.x1), field('y1', L.y1));
+    item.append(head, grid);
+    box.appendChild(item);
+  }
+}
+
 function renderLegend() {
+  renderLineList();
   const box = $('lp-legend');
   box.innerHTML = '';
   for (const L of S.lines) {
@@ -587,9 +655,9 @@ function renderLegend() {
     item.className = 'lp-item' + (L.id === LP.active ? ' active' : '') + (L.visible ? '' : ' hidden-line');
     item.title = `(${fmt(L.x0)}, ${fmt(L.y0)}) → (${fmt(L.x1)}, ${fmt(L.y1)})  length ${fmt(lineLength(L))}, ${lineAngle(L).toFixed(1)}°\nclick: select · checkbox: show/hide · ✕: delete`;
     const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = L.visible;
-    cb.onclick = ev => { ev.stopPropagation(); pushHistory(`${cb.checked ? 'show' : 'hide'} L${L.id}`); L.visible = cb.checked; renderLegend(); showLinePanel(); drawLineChart(); requestRender(); };
+    cb.onclick = ev => { ev.stopPropagation(); pushHistory(`${cb.checked ? 'show' : 'hide'} ${lineName(L)}`); L.visible = cb.checked; renderLegend(); showLinePanel(); drawLineChart(); requestRender(); };
     const sw = document.createElement('i'); sw.className = 'swatch'; sw.style.background = lineColor(L);
-    const nm = document.createElement('span'); nm.textContent = `L${L.id}`;
+    const nm = document.createElement('span'); nm.textContent = `${lineName(L)}`;
     const x = document.createElement('button'); x.className = 'x'; x.textContent = '✕'; x.title = 'delete this line';
     x.onclick = ev => { ev.stopPropagation(); removeLine(L); };
     item.append(cb, sw, nm, x);
@@ -728,7 +796,7 @@ function drawLineChart() {
       v.L.hoverIdx = i;
       const y = v.vals[i];
       if (y !== null) { ctx.fillStyle = lineColor(v.L); ctx.beginPath(); ctx.arc(X(dist[i]), Y(y), 3.2, 0, 2 * Math.PI); ctx.fill(); }
-      infos.push(`L${v.L.id} = ${y === null ? 'outside' : fmt(y, 6)}`);
+      infos.push(`${lineName(v.L)} = ${y === null ? 'outside' : fmt(y, 6)}`);
     }
   } else {
     for (const L of S.lines) L.hoverIdx = null;
@@ -792,7 +860,7 @@ $('lp-elem').onchange = ev => { LP.showElem = ev.target.checked; drawLineChart()
 const resetChartZoom = () => { LP.xview = null; LP.yview = null; drawLineChart(); requestRender(); };
 lpc.addEventListener('dblclick', resetChartZoom);
 $('lp-reset').onclick = resetChartZoom;
-$('lp-close').onclick = clearLines;
+$('lp-close').onclick = () => setLineWindow(false);
 // move the panel by its header; resize with the grip in the corner (CSS resize)
 $('lp-head').addEventListener('mousedown', ev => {
   if (ev.target.closest('button')) return;
@@ -828,15 +896,20 @@ glCanvas.addEventListener('mousedown', ev => {
     const L = S.drag.line, before = S.drag.before; S.drag = null;
     glCanvas.style.cursor = '';
     LP.xview = null; LP.yview = null;
-    if (lineLength(L) > 0) { pushHistory(`add line L${L.id}`, before); runLine(L); } else removeLine(L, false);
+    if (lineLength(L) > 0) { pushHistory(`add line ${lineName(L)}`, before); setLineWindow(true); runLine(L); } else removeLine(L, false);
     ev.preventDefault();
     return;
   }
-  const hit = ev.shiftKey ? null : hitLine(px, py);
+  const hit = (ev.shiftKey || BD.pick || NL.mode) ? null : hitLine(px, py);
   const before = snapshot();
   if (hit) {   // grab an end point or the body of an existing line
     const L = hit.line;
-    S.drag = { kind: 'line-edit', line: L, part: hit.part, px, py, orig: { x0: L.x0, y0: L.y0, x1: L.x1, y1: L.y1 }, moved: false, before };
+    S.drag = { kind: 'line-edit', line: L, part: hit.part, px, py, orig: { x0: L.x0, y0: L.y0, x1: L.x1, y1: L.y1 }, moved: false, before, allowed: null };
+    if (L.kind === 'normal' && L.anchor) {
+      const D = S.drag;
+      D.allowed = allowedEdgesFor(L);
+      if (!(BD.groups && BD.groups.angle === BD.angle)) ensureGroups().then(() => { if (S.drag === D) D.allowed = allowedEdgesFor(L); }).catch(() => {});
+    }
     LP.active = L.id; renderLegend(); drawLineChart(); requestRender();
   } else if (ev.shiftKey || S.lineMode) {
     const [x, y] = screenToData(px, py);
@@ -872,7 +945,12 @@ window.addEventListener('mousemove', ev => {
     const D = S.drag, L = D.line;
     const [x, y] = screenToData(px, py);
     if (Math.abs(px - D.px) + Math.abs(py - D.py) > 2) D.moved = true;
-    if (D.part === 'body') {
+    if (L.kind === 'normal' && L.anchor && BD.ext) {
+      if (D.part === 1) setNormalLength(L, x, y);                    // far end: length only
+      else { const h = boundaryPointAt(px, py, D.allowed, NL.snap, 60); if (h) setNormalOrigin(L, h); }   // origin: slide along its boundary
+      showDragInfo(L);
+      requestRender();
+    } else if (D.part === 'body') {
       const [ox, oy] = screenToData(D.px, D.py);
       L.x0 = D.orig.x0 + x - ox; L.y0 = D.orig.y0 + y - oy; L.x1 = D.orig.x1 + x - ox; L.y1 = D.orig.y1 + y - oy;
     } else {
@@ -883,6 +961,20 @@ window.addEventListener('mousemove', ev => {
     }
     showDragInfo(L);
     requestRender();
+  } else if (ev.target === glCanvas && NL.mode) {
+    S.hover = [px, py];
+    NL.hover = boundaryPointAt(px, py);
+    $('probe').classList.toggle('muted', !NL.hover);
+    $('probe').textContent = NL.hover ? `${NL.hover.node !== null ? `boundary node ${NL.hover.node}` : `boundary point t = ${fmt(NL.hover.t, 4)}`} of ${edgeLabel(NL.hover.edge)}\nnormal (${fmt(NL.hover.nx, 4)}, ${fmt(NL.hover.ny, 4)})\nclick: wall-normal line of length ${fmt(NL.length, 5)}` : (NL.snap ? 'hover a boundary GLL node' : 'hover the boundary');
+    requestRender();
+  } else if (ev.target === glCanvas && BD.pick) {
+    S.hover = [px, py];
+    const i = edgeAt(px, py);
+    if (i !== BD.hoverEdge) { BD.hoverEdge = i; requestRender(); }
+    $('probe').classList.toggle('muted', i < 0);
+    $('probe').textContent = i >= 0 ? `external edge: ${edgeLabel(i)}
+${BD.editing ? `click: add to / remove from ${BD.editing.name}` : 'click: start a new boundary'}
+double-click: whole run up to the corners` : 'hover an external edge';
   } else if (ev.target === glCanvas) {
     S.hover = [px, py];
     LP.hoverHit = (ev.shiftKey) ? null : hitLine(px, py);
@@ -897,13 +989,19 @@ window.addEventListener('mouseup', ev => {
   const d = S.drag; S.drag = null;
   if (d.kind === 'line') {
     LP.xview = null; LP.yview = null;
-    if (lineLength(d.line) > 0) { pushHistory(`add line L${d.line.id}`, d.before); runLine(d.line); } else removeLine(d.line, false);
+    if (lineLength(d.line) > 0) { pushHistory(`add line ${lineName(d.line)}`, d.before); setLineWindow(true); runLine(d.line); } else removeLine(d.line, false);
     setLineMode(false);
   } else if (d.kind === 'line-edit') {
-    if (d.moved) { pushHistory(`move L${d.line.id}`, d.before); LP.xview = null; LP.yview = null; runLine(d.line); } else { renderLegend(); drawLineChart(); }
+    if (d.moved) { pushHistory(`move ${lineName(d.line)}`, d.before); LP.xview = null; LP.yview = null; runLine(d.line); } else { renderLegend(); drawLineChart(); }
     requestRender();
   } else if (d.kind === 'pan' && d.moved) {
     pushHistory('pan', d.before);
+  } else if (d.kind === 'pan' && !d.moved && ev.target === glCanvas && NL.mode) {
+    const rect = glCanvas.getBoundingClientRect();
+    createNormalLine(boundaryPointAt(ev.clientX - rect.left, ev.clientY - rect.top));
+  } else if (d.kind === 'pan' && !d.moved && ev.target === glCanvas && BD.pick) {
+    const rect = glCanvas.getBoundingClientRect();
+    pickClick(ev.clientX - rect.left, ev.clientY - rect.top, false);
   } else if (d.kind === 'pan' && !d.moved && ev.target === glCanvas) {
     const rect = glCanvas.getBoundingClientRect();
     const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
@@ -918,7 +1016,414 @@ window.addEventListener('mouseup', ev => {
 });
 glCanvas.addEventListener('mouseleave', () => { S.hover = null; LP.hoverHit = null; if (!S.probePinned) showProbe(null); });
 function resetViewUser() { pushHistory('reset view'); fitView(); }
-glCanvas.addEventListener('dblclick', ev => { if (!hitLine(ev.clientX - glCanvas.getBoundingClientRect().left, ev.clientY - glCanvas.getBoundingClientRect().top)) resetViewUser(); });
+glCanvas.addEventListener('dblclick', ev => {
+  const rect = glCanvas.getBoundingClientRect();
+  const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
+  if (BD.pick) { pickClick(px, py, true); return; }
+  if (NL.mode) return;
+  if (!hitLine(px, py)) resetViewUser();
+});
+
+// ----------------------------------------------------------------- boundaries
+// External element edges come from the server once per dataset (as polylines);
+// boundaries are sets of edge indices: auto-detected (chained + split at
+// corners) or picked by hand on the plot.
+const BD_COLORS = ['#f97316', '#22c55e', '#a855f7', '#ef4444', '#06b6d4', '#eab308', '#ec4899', '#84cc16'];
+const BD = { ext: null, loading: null, angle: 90, groups: null, pick: false, editing: null, hoverEdge: -1, nextId: 1, clickTimer: null };
+const bdColor = b => BD_COLORS[b.colorIdx % BD_COLORS.length];
+const boundaryById = id => S.boundaries.find(b => b.id === id) || null;
+
+async function loadBoundaryEdges() {
+  if (BD.ext) return BD.ext;
+  if (!BD.loading) {
+    BD.loading = (async () => {
+      const { buf } = await api('boundary/edges', { m: 16 });
+      const head = new Int32Array(buf, 0, 3);
+      const nb = head[0], m = head[1], n = head[2];
+      let off = 12;
+      const ids = new Int32Array(buf, off, nb * 2); off += nb * 8;
+      const coords = new Float32Array(buf, off, nb * m * 2); off += nb * m * 8;
+      const nodes = new Float32Array(buf, off, nb * n * 2); off += nb * n * 8;
+      const normals = new Float32Array(buf, off, nb * n * 2);
+      const index = new Map();
+      const bbox = new Float32Array(nb * 4);
+      for (let i = 0; i < nb; i++) {
+        index.set(`${ids[2 * i]}:${ids[2 * i + 1]}`, i);
+        let a = Infinity, b = -Infinity, c = Infinity, d = -Infinity;
+        for (let k = 0; k < m; k++) { const x = coords[(i * m + k) * 2], y = coords[(i * m + k) * 2 + 1]; if (x < a) a = x; if (x > b) b = x; if (y < c) c = y; if (y > d) d = y; }
+        bbox[4 * i] = a; bbox[4 * i + 1] = b; bbox[4 * i + 2] = c; bbox[4 * i + 3] = d;
+      }
+      BD.ext = { nb, m, n, ids, coords, nodes, normals, index, bbox };
+      return BD.ext;
+    })();
+  }
+  try { return await BD.loading; } finally { BD.loading = null; }
+}
+
+/** Auto-detected grouping of the external edges at the current angle (used for double-click picking). */
+async function ensureGroups() {
+  await loadBoundaryEdges();
+  if (BD.groups && BD.groups.angle === BD.angle) return BD.groups;
+  const det = await api('boundary/detect', { angle: BD.angle });
+  const edgeGroup = new Int32Array(BD.ext.nb).fill(-1);
+  det.groups.forEach((g, gi) => { for (const e of g.edges) edgeGroup[e] = gi; });
+  BD.groups = { angle: BD.angle, groups: det.groups, edgeGroup };
+  return BD.groups;
+}
+
+function newBoundary(source, name = null) {
+  const used = new Set(S.boundaries.map(b => b.colorIdx));
+  let c = 0;
+  while (used.has(c) && c < BD_COLORS.length) c++;
+  const id = BD.nextId++;
+  const b = { id, name: name || (source === 'manual' ? `M${id}` : `B${id}`), colorIdx: c, source, visible: true, edges: [], closed: false };
+  S.boundaries.push(b);
+  return b;
+}
+
+async function detectBoundaries() {
+  if (!S.meta || !S.meta.open) return;
+  try {
+    const G = await ensureGroups();
+    pushHistory('detect boundaries');
+    S.boundaries = S.boundaries.filter(b => b.source !== 'auto');
+    for (const g of G.groups) { const b = newBoundary('auto', g.name); b.edges = g.edges.slice(); b.closed = g.closed; }
+    renderBoundaryList(); requestRender();
+    toast(`${G.groups.length} boundar${G.groups.length === 1 ? 'y' : 'ies'} at a ${BD.angle}° feature angle`);
+  } catch (err) { toast(err.message, true); }
+}
+
+function removeBoundary(b, record = true) {
+  if (record) pushHistory(`delete boundary ${b.name}`);
+  S.boundaries = S.boundaries.filter(o => o !== b);
+  if (BD.editing === b) BD.editing = null;
+  renderBoundaryList(); requestRender();
+}
+
+function setPickMode(on, boundary = null) {
+  if (on && NL.mode) setNormalMode(false);
+  BD.pick = on;
+  BD.editing = on ? boundary : null;
+  BD.hoverEdge = -1;
+  document.body.classList.toggle('picking', on);
+  $('bd-done').hidden = !on;
+  $('bd-new').hidden = on;
+  if (on) {
+    loadBoundaryEdges().then(() => requestRender()).catch(err => toast(err.message, true));
+    toast(boundary ? `Editing ${boundary.name}: click edges to add or remove them, double-click for a whole run, Done to finish` : 'Click external edges to build a boundary (double-click: whole run up to the corners); Done or Esc to finish');
+  }
+  renderBoundaryList(); requestRender();
+}
+
+const segDist = (px, py, ax, ay, bx, by) => {
+  const l2 = (bx - ax) ** 2 + (by - ay) ** 2;
+  const t = l2 ? clamp(((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / l2, 0, 1) : 0;
+  return Math.hypot(px - (ax + t * (bx - ax)), py - (ay + t * (by - ay)));
+};
+
+/** Index of the external edge within maxDist screen px of the cursor, or -1. */
+function edgeAt(px, py, maxDist = 8, allowed = null) {
+  const E = BD.ext; if (!E) return -1;
+  const [x, y] = screenToData(px, py);
+  const tol = maxDist / S.view.scale;
+  let best = -1, bestD = maxDist;
+  for (let i = 0; i < E.nb; i++) {
+    if (allowed && !allowed.has(i)) continue;
+    if (x < E.bbox[4 * i] - tol || x > E.bbox[4 * i + 1] + tol || y < E.bbox[4 * i + 2] - tol || y > E.bbox[4 * i + 3] + tol) continue;
+    for (let k = 0; k < E.m - 1; k++) {
+      const o = (i * E.m + k) * 2;
+      const [ax, ay] = dataToScreen(E.coords[o], E.coords[o + 1]);
+      const [bx, by] = dataToScreen(E.coords[o + 2], E.coords[o + 3]);
+      const d = segDist(px, py, ax, ay, bx, by);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+  }
+  return best;
+}
+
+function boundaryAt(px, py) {
+  if (!BD.ext || !S.showBoundaries) return null;
+  const i = edgeAt(px, py, 7);
+  if (i < 0) return null;
+  const hits = S.boundaries.filter(b => b.visible && b.edges.includes(i));
+  return hits.length ? hits[hits.length - 1] : null;
+}
+
+const edgeLabel = i => { const E = BD.ext; const e = E.ids[2 * i], sd = E.ids[2 * i + 1]; return `element ${S.mesh ? S.mesh.elmap[e] : e} (local ${e}), ${['bottom', 'right', 'top', 'left'][sd]} side`; };
+
+async function toggleEdge(i, wholeRun = false) {
+  if (i < 0 || !BD.ext) return;
+  try {
+    let idx = [i];
+    if (wholeRun) { const G = await ensureGroups(); const gi = G.edgeGroup[i]; if (gi >= 0) idx = G.groups[gi].edges.slice(); }
+    const before = snapshot();
+    let b = BD.editing;
+    if (!b) { b = newBoundary('manual'); BD.editing = b; }
+    if (b.source === 'auto') b.source = 'manual';
+    const set = new Set(b.edges);
+    const adding = !set.has(i);
+    for (const e of idx) { if (adding) set.add(e); else set.delete(e); }
+    b.edges = [...set];
+    pushHistory(`${adding ? 'add' : 'remove'} ${idx.length} edge${idx.length === 1 ? '' : 's'} (${b.name})`, before);
+    renderBoundaryList(); requestRender();
+  } catch (err) { toast(err.message, true); }
+}
+
+function pickClick(px, py, dbl) {
+  // single clicks are delayed briefly so that a double-click toggles a whole run only once
+  if (BD.clickTimer) { clearTimeout(BD.clickTimer); BD.clickTimer = null; }
+  const i = edgeAt(px, py);
+  if (dbl) { toggleEdge(i, true); return; }
+  BD.clickTimer = setTimeout(() => { BD.clickTimer = null; toggleEdge(i, false); }, 260);
+}
+
+function renderBoundaryList() {
+  const box = $('bd-list');
+  box.innerHTML = '';
+  for (const b of S.boundaries) {
+    const row = document.createElement('div');
+    row.className = 'bd-item' + (BD.editing === b ? ' active' : '') + (b.visible ? '' : ' hidden-b');
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = b.visible; cb.title = 'show / hide';
+    cb.onchange = () => { pushHistory(`${cb.checked ? 'show' : 'hide'} boundary ${b.name}`); b.visible = cb.checked; renderBoundaryList(); requestRender(); };
+    const sw = document.createElement('i'); sw.className = 'swatch'; sw.style.background = bdColor(b);
+    const nm = document.createElement('input'); nm.className = 'name'; nm.value = b.name; nm.title = 'rename';
+    nm.onchange = () => { const v = nm.value.trim(); if (v && v !== b.name) { pushHistory(`rename ${b.name}`); b.name = v; renderBoundaryList(); requestRender(); } else nm.value = b.name; };
+    nm.onkeydown = ev => { if (ev.key === 'Enter') nm.blur(); ev.stopPropagation(); };
+    const cnt = document.createElement('span'); cnt.className = 'count'; cnt.textContent = `${b.edges.length} edge${b.edges.length === 1 ? '' : 's'}${b.source === 'auto' ? '' : ' · manual'}`;
+    const ed = document.createElement('button'); ed.className = 'edit'; ed.textContent = '✎'; ed.title = 'edit: pick edges on the plot';
+    ed.onclick = () => setPickMode(!(BD.pick && BD.editing === b), b);
+    const x = document.createElement('button'); x.className = 'x'; x.textContent = '✕'; x.title = 'delete';
+    x.onclick = () => removeBoundary(b);
+    row.append(cb, sw, nm, cnt, ed, x);
+    box.appendChild(row);
+  }
+}
+
+function drawBoundaries() {
+  const E = BD.ext;
+  if (!E) return;
+  const light = isLight();
+  const [vx0, vy0] = screenToData(0, H()), [vx1, vy1] = screenToData(W(), 0);
+  const visible = i => !(E.bbox[4 * i + 1] < vx0 || E.bbox[4 * i] > vx1 || E.bbox[4 * i + 3] < vy0 || E.bbox[4 * i + 2] > vy1);
+  const path = idxs => {
+    octx.beginPath();
+    for (const i of idxs) {
+      if (!visible(i)) continue;
+      for (let k = 0; k < E.m; k++) { const o = (i * E.m + k) * 2; const [sx, sy] = dataToScreen(E.coords[o], E.coords[o + 1]); if (k === 0) octx.moveTo(sx, sy); else octx.lineTo(sx, sy); }
+    }
+    octx.stroke();
+  };
+  octx.lineCap = 'round'; octx.lineJoin = 'round';
+  if (BD.pick || NL.mode) {   // every external edge, faint, so that unassigned ones can be found
+    octx.strokeStyle = light ? 'rgba(27,33,48,.35)' : 'rgba(255,255,255,.4)'; octx.lineWidth = 1.5;
+    path(Array.from({ length: E.nb }, (_, i) => i));
+  }
+  if (S.showBoundaries) {
+    for (const b of S.boundaries) {
+      if (!b.visible || !b.edges.length) continue;
+      octx.strokeStyle = bdColor(b); octx.lineWidth = BD.editing === b ? 4 : 2.5;
+      path(b.edges);
+      const mid = b.edges[Math.floor(b.edges.length / 2)];
+      if (visible(mid)) {
+        const o = (mid * E.m + Math.floor(E.m / 2)) * 2;
+        const [lx, ly] = dataToScreen(E.coords[o], E.coords[o + 1]);
+        octx.font = '600 11px -apple-system, Segoe UI, Inter, Roboto, sans-serif';
+        octx.fillStyle = bdColor(b); octx.textAlign = 'left'; octx.textBaseline = 'bottom';
+        octx.fillText(b.name, lx + 6, ly - 4);
+        octx.font = '11px ui-monospace, Menlo, Consolas, monospace';
+      }
+    }
+  }
+  if (BD.pick && BD.hoverEdge >= 0) {
+    octx.strokeStyle = light ? '#0b3d91' : '#5cc8ff'; octx.lineWidth = 5;
+    path([BD.hoverEdge]);
+  }
+}
+
+$('bd-detect').onclick = detectBoundaries;
+$('bd-angle').onchange = ev => { BD.angle = clamp(parseFloat(ev.target.value) || 0, 0, 180); ev.target.value = BD.angle; };
+$('bd-new').onclick = () => setPickMode(true, null);
+$('bd-done').onclick = () => setPickMode(false);
+$('bd-show').onchange = ev => { S.showBoundaries = ev.target.checked; requestRender(); };
+
+// ----------------------------------------------------------------- wall-normal lines
+// A line probe anchored at a boundary GLL node, following the inward normal.
+const NL = { mode: false, hover: null, length: null, snap: false };
+
+function defaultNormalLength() {
+  if (!S.meta || !S.meta.open) return 1;
+  const [x0, x1, y0, y1] = S.meta.bounds;
+  const v = 0.1 * Math.min(x1 - x0, y1 - y0);
+  return +v.toPrecision(3);
+}
+function setNormalMode(on) {
+  if (on) { setPickMode(false); setLineMode(false); }
+  NL.mode = on; NL.hover = null;
+  document.body.classList.toggle('normal-mode', on);
+  $('btn-normal').classList.toggle('active', on);
+  if (on) {
+    if (NL.length === null) { NL.length = defaultNormalLength(); $('nl-length').value = NL.length; }
+    loadBoundaryEdges().then(() => requestRender()).catch(err => toast(err.message, true));
+    toast('Hover a boundary node and click to create a wall-normal line; Esc or the button to finish');
+  }
+  requestRender();
+}
+
+/** Position and outward unit normal at parameter t (-1..1) along external edge i, from the spectral edge geometry. */
+function edgePoint(i, t) {
+  const E = BD.ext, n = E.n, sp = S.spectral;
+  const Lb = new Float64Array(n), dLb = new Float64Array(n);
+  basis(sp.nodes, sp.w, sp.D, t, Lb, dLb);
+  let x = 0, y = 0, tx = 0, ty = 0;
+  for (let k = 0; k < n; k++) { const o = (i * n + k) * 2; x += Lb[k] * E.nodes[o]; y += Lb[k] * E.nodes[o + 1]; tx += dLb[k] * E.nodes[o]; ty += dLb[k] * E.nodes[o + 1]; }
+  let nx = ty, ny = -tx;
+  const nn = Math.hypot(nx, ny) || 1; nx /= nn; ny /= nn;
+  // orientation from the server-side normal at the nearest GLL node (handles mirrored elements)
+  let k0 = 0; for (let k = 1; k < n; k++) if (Math.abs(sp.nodes[k] - t) < Math.abs(sp.nodes[k0] - t)) k0 = k;
+  const o0 = (i * n + k0) * 2;
+  if (nx * E.normals[o0] + ny * E.normals[o0 + 1] < 0) { nx = -nx; ny = -ny; }
+  return { edge: i, t, node: null, x, y, nx, ny };
+}
+
+/** Closest point (in screen space) on external edge i to the cursor: coarse polyline search, then refinement in t. */
+function closestOnEdge(i, px, py) {
+  const E = BD.ext;
+  let bestK = 0, bestD = Infinity;
+  for (let k = 0; k < E.m; k++) { const o = (i * E.m + k) * 2; const [sx, sy] = dataToScreen(E.coords[o], E.coords[o + 1]); const d = Math.hypot(px - sx, py - sy); if (d < bestD) { bestD = d; bestK = k; } }
+  let lo = -1 + 2 * Math.max(0, bestK - 1) / (E.m - 1), hi = -1 + 2 * Math.min(E.m - 1, bestK + 1) / (E.m - 1);
+  let best = null, bestT = 0;
+  for (let level = 0; level < 3; level++) {
+    const N = 24; bestD = Infinity;
+    for (let q = 0; q <= N; q++) {
+      const t = lo + (hi - lo) * q / N;
+      const pt = edgePoint(i, t);
+      const [sx, sy] = dataToScreen(pt.x, pt.y);
+      const d = Math.hypot(px - sx, py - sy);
+      if (d < bestD) { bestD = d; bestT = t; best = pt; }
+    }
+    const h = (hi - lo) / N; lo = Math.max(-1, bestT - h); hi = Math.min(1, bestT + h);
+  }
+  return { ...best, d: bestD };
+}
+
+/** Nearest boundary GLL node within maxDist screen px (optionally restricted to a set of edges). */
+function boundaryNodeAt(px, py, maxDist = 25, allowed = null) {
+  const E = BD.ext; if (!E) return null;
+  const [x, y] = screenToData(px, py);
+  const tol = maxDist / S.view.scale;
+  let best = null, bestD = maxDist;
+  for (let i = 0; i < E.nb; i++) {
+    if (allowed && !allowed.has(i)) continue;
+    if (x < E.bbox[4 * i] - tol || x > E.bbox[4 * i + 1] + tol || y < E.bbox[4 * i + 2] - tol || y > E.bbox[4 * i + 3] + tol) continue;
+    for (let k = 0; k < E.n; k++) {
+      const o = (i * E.n + k) * 2;
+      const [sx, sy] = dataToScreen(E.nodes[o], E.nodes[o + 1]);
+      const d = Math.hypot(px - sx, py - sy);
+      if (d < bestD) { bestD = d; best = { edge: i, node: k, t: S.spectral.nodes[k], x: E.nodes[o], y: E.nodes[o + 1], nx: E.normals[o], ny: E.normals[o + 1] }; }
+    }
+  }
+  return best;
+}
+
+/** A point on the boundary near the cursor: a GLL node when snapping, otherwise anywhere on the edge curve. */
+function boundaryPointAt(px, py, allowed = null, snap = NL.snap, maxDist = 25) {
+  if (!BD.ext) return null;
+  if (snap) return boundaryNodeAt(px, py, maxDist, allowed);
+  const i = edgeAt(px, py, maxDist, allowed);
+  return i < 0 ? null : closestOnEdge(i, px, py);
+}
+
+const edgeIndexOf = a => (BD.ext && a) ? (BD.ext.index.get(`${a.elem}:${a.side}`) ?? -1) : -1;
+const normalLineEnd = (h, len = NL.length) => [h.x - len * h.nx, h.y - len * h.ny];
+
+/** Apply a boundary point as the origin of a wall-normal line, keeping its length. */
+function setNormalOrigin(L, h) {
+  const E = BD.ext;
+  const len = L.anchor ? L.anchor.length : NL.length;
+  L.anchor = { elem: E.ids[2 * h.edge], side: E.ids[2 * h.edge + 1], node: h.node, t: h.t, nx: h.nx, ny: h.ny, length: len };
+  L.x0 = h.x; L.y0 = h.y;
+  [L.x1, L.y1] = normalLineEnd(h, len);
+}
+/** Change only the length of a wall-normal line so that its end is the projection of (x, y) onto the normal. */
+function setNormalLength(L, x, y) {
+  const a = L.anchor;
+  const len = -((x - L.x0) * a.nx + (y - L.y0) * a.ny);
+  L.anchor = { ...a, length: len };
+  L.x1 = L.x0 - len * a.nx; L.y1 = L.y0 - len * a.ny;
+}
+/** Edges a wall-normal origin may slide along: the connected boundary run of its edge (same group at the current angle). */
+function allowedEdgesFor(L) {
+  const i = edgeIndexOf(L.anchor);
+  if (i < 0) return null;
+  if (BD.groups && BD.groups.angle === BD.angle) {
+    const gi = BD.groups.edgeGroup[i];
+    if (gi >= 0) return new Set(BD.groups.groups[gi].edges);
+  }
+  return new Set([i]);
+}
+
+function createNormalLine(h) {
+  if (!h || !Number.isFinite(NL.length) || NL.length === 0) { toast('Set a non-zero length first', true); return; }
+  const before = snapshot();
+  const L = newLine(h.x, h.y);
+  L.kind = 'normal';
+  setNormalOrigin(L, h);
+  pushHistory(`add wall-normal line ${lineName(L)}`, before);
+  LP.xview = null; LP.yview = null;
+  setLineWindow(true);
+  renderLegend(); runLine(L); requestRender();
+}
+
+function drawNormalPreview() {
+  const E = BD.ext; if (!E || !NL.mode) return;
+  const light = isLight();
+  const [vx0, vy0] = screenToData(0, H()), [vx1, vy1] = screenToData(W(), 0);
+  // boundary GLL nodes of the visible edges (only when snapping, and when they are resolvable on screen)
+  octx.fillStyle = light ? 'rgba(11,61,145,.6)' : 'rgba(92,200,255,.7)';
+  for (let i = 0; NL.snap && i < E.nb; i++) {
+    if (E.bbox[4 * i + 1] < vx0 || E.bbox[4 * i] > vx1 || E.bbox[4 * i + 3] < vy0 || E.bbox[4 * i + 2] > vy1) continue;
+    const size = Math.max(E.bbox[4 * i + 1] - E.bbox[4 * i], E.bbox[4 * i + 3] - E.bbox[4 * i + 2]) * S.view.scale;
+    if (size < 24) continue;
+    for (let k = 0; k < E.n; k++) { const o = (i * E.n + k) * 2; const [sx, sy] = dataToScreen(E.nodes[o], E.nodes[o + 1]); octx.beginPath(); octx.arc(sx, sy, 2, 0, 2 * Math.PI); octx.fill(); }
+  }
+  const h = NL.hover;
+  if (!h) return;
+  const [ax, ay] = dataToScreen(h.x, h.y), [bx, by] = dataToScreen(...normalLineEnd(h));
+  const col = light ? '#c2410c' : '#ffd166';
+  octx.strokeStyle = col; octx.lineWidth = 1.5; octx.setLineDash([5, 4]);
+  octx.beginPath(); octx.moveTo(ax, ay); octx.lineTo(bx, by); octx.stroke();
+  octx.setLineDash([]);
+  octx.fillStyle = col; octx.strokeStyle = light ? '#fff' : '#0d0f14'; octx.lineWidth = 1.2;
+  octx.beginPath(); octx.arc(ax, ay, 5, 0, 2 * Math.PI); octx.fill(); octx.stroke();
+  octx.beginPath(); octx.arc(bx, by, 3, 0, 2 * Math.PI); octx.fill();
+}
+
+$('btn-normal').onclick = () => setNormalMode(!NL.mode);
+$('nl-length').onchange = ev => { const v = parseFloat(ev.target.value); if (Number.isFinite(v)) { NL.length = v; requestRender(); } else ev.target.value = NL.length ?? ''; };
+$('nl-snap').onchange = ev => { NL.snap = ev.target.checked; NL.hover = null; requestRender(); };
+
+// ----------------------------------------------------------------- collapsible sidebar sections
+(function makeCollapsible() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem('semview.collapsed') || '{}'); } catch { /* ignore */ }
+  for (const panel of document.querySelectorAll('#sidebar .panel')) {
+    const h2 = panel.querySelector('h2');
+    if (!h2) continue;
+    const body = document.createElement('div'); body.className = 'panel-body';
+    while (h2.nextSibling) body.appendChild(h2.nextSibling);
+    panel.appendChild(body);
+    const chev = document.createElement('span'); chev.className = 'chev'; chev.textContent = '▾';
+    h2.appendChild(chev);
+    const key = panel.dataset.panel || h2.textContent.trim();
+    panel.classList.toggle('collapsed', saved[key] === true);
+    h2.title = 'click to collapse / expand';
+    h2.addEventListener('click', () => {
+      panel.classList.toggle('collapsed');
+      saved[key] = panel.classList.contains('collapsed');
+      try { localStorage.setItem('semview.collapsed', JSON.stringify(saved)); } catch { /* ignore */ }
+    });
+  }
+})();
 
 // ----------------------------------------------------------------- context menu
 async function copyText(text, what = 'Copied') {
@@ -948,7 +1453,7 @@ function lineCSV(lines) {
     for (let i = 0; i < d.distance.length; i++) {
       if (vals[i] === null) continue;
       const gid = d.elem[i] >= 0 && S.mesh ? S.mesh.elmap[d.elem[i]] : '';
-      rows.push(`L${L.id},${d.distance[i]},${d.x[i]},${d.y[i]},${gid},${vals[i]}`);
+      rows.push(`${lineName(L)},${d.distance[i]},${d.x[i]},${d.y[i]},${gid},${vals[i]}`);
     }
   }
   return rows.join('\n') + '\n';
@@ -971,7 +1476,21 @@ function pythonSnippet() {
   if (S.contours) lines.push(`pl.add_contours(data, ${JSON.stringify(field)}, levels=${S.nContours}, colors="w", linewidths=0.5)`);
   if (S.edges) lines.push('pl.add_mesh(data, color="k", linewidth=0.3)');
   if (S.nodes) lines.push('pl.add_nodes(data)');
-  for (const L of S.lines) lines.push(`dist_L${L.id}, vals_L${L.id} = data.sample_line(${JSON.stringify(field)}, (${fmt(L.x0, 7)}, ${fmt(L.y0, 7)}), (${fmt(L.x1, 7)}, ${fmt(L.y1, 7)}), 1000)`);
+  if (S.boundaries.some(b => b.source === 'auto' && b.visible)) lines.push(`boundaries = data.detect_boundaries(angle=${BD.angle})`, 'pl.add_boundaries(data, boundaries)');
+  if (BD.ext) for (const b of S.boundaries) if (b.source !== 'auto' && b.visible && b.edges.length) {
+    const pairs = b.edges.map(i => `(${BD.ext.ids[2 * i]}, ${BD.ext.ids[2 * i + 1]})`).join(', ');
+    const v = b.name.replace(/\W+/g, '_');
+    lines.push(`b_${v} = data.boundary([${pairs}], name=${JSON.stringify(b.name)})`, `pl.add_boundaries(data, [b_${v}])`);
+  }
+  for (const L of S.lines) {
+    if (L.kind === 'normal' && L.anchor) {
+      if (L.anchor.node !== null && L.anchor.node !== undefined) lines.push(`p0_${lineName(L)}, p1_${lineName(L)} = data.normal_line(${L.anchor.elem}, ${L.anchor.side}, ${L.anchor.node}, ${fmt(L.anchor.length, 7)})   # wall-normal from a boundary GLL node`);
+      else lines.push(`p0_${lineName(L)}, p1_${lineName(L)} = data.normal_line_at(${L.anchor.elem}, ${L.anchor.side}, ${fmt(L.anchor.t, 7)}, ${fmt(L.anchor.length, 7)})   # wall-normal from edge parameter t`);
+      lines.push(`dist_${lineName(L)}, vals_${lineName(L)} = data.sample_line(${JSON.stringify(field)}, p0_${lineName(L)}, p1_${lineName(L)}, 1000)`);
+    } else {
+      lines.push(`dist_${lineName(L)}, vals_${lineName(L)} = data.sample_line(${JSON.stringify(field)}, (${fmt(L.x0, 7)}, ${fmt(L.y0, 7)}), (${fmt(L.x1, 7)}, ${fmt(L.y1, 7)}), 1000)`);
+    }
+  }
   if (S.probePinned) lines.push(`probe = data.sample(${JSON.stringify(field)}, ${fmt(S.probePinned.x, 7)}, ${fmt(S.probePinned.y, 7)})`);
   lines.push(`pl.set_view((${fmt(x0, 7)}, ${fmt(x1, 7)}), (${fmt(y0, 7)}, ${fmt(y1, 7)}))`);
   lines.push(`pl.set_title(${JSON.stringify(`${S.meta.name}: ${S.field}`)})`);
@@ -990,7 +1509,7 @@ function zoomToElement(e) {
 }
 
 const ctxEl = $('ctx');
-function closeCtx() { ctxEl.hidden = true; ctxEl.innerHTML = ''; }
+function closeCtx() { ctxEl.hidden = true; ctxEl.innerHTML = ''; ctxEl.dataset.menu = ''; for (const b of document.querySelectorAll('.menu-btn')) b.classList.remove('open'); }
 function openCtx(items, clientX, clientY) {
   ctxEl.innerHTML = '';
   for (const it of items) {
@@ -998,13 +1517,16 @@ function openCtx(items, clientX, clientY) {
     if (it.header) { const d = document.createElement('div'); d.className = 'hd'; d.textContent = it.header; ctxEl.appendChild(d); continue; }
     const d = document.createElement('div');
     d.className = 'it' + (it.disabled ? ' disabled' : '');
-    const label = document.createElement('span'); label.textContent = it.label; d.appendChild(label);
+    const label = document.createElement('span');
+    if (it.checked !== undefined) { const chk = document.createElement('span'); chk.className = 'chk'; chk.textContent = it.checked ? '✓' : ''; label.appendChild(chk); }
+    label.appendChild(document.createTextNode(it.label));
+    d.appendChild(label);
     if (it.key) { const k = document.createElement('span'); k.className = 'key'; k.textContent = it.key; d.appendChild(k); }
     d.onclick = () => { closeCtx(); it.action(); };
     ctxEl.appendChild(d);
   }
   ctxEl.hidden = false;
-  const v = $('view').getBoundingClientRect();
+  const v = $('app').getBoundingClientRect();
   let left = clientX - v.left, top = clientY - v.top;
   left = Math.min(left, v.width - ctxEl.offsetWidth - 6);
   top = Math.min(top, v.height - ctxEl.offsetHeight - 6);
@@ -1039,13 +1561,23 @@ glCanvas.addEventListener('contextmenu', ev => {
   if (hit) {
     const L = hit.line;
     items.push('-');
-    items.push({ header: `line L${L.id}: (${fmt(L.x0, 5)}, ${fmt(L.y0, 5)}) → (${fmt(L.x1, 5)}, ${fmt(L.y1, 5)})` });
-    items.push({ label: L.visible ? `Hide L${L.id} in the chart` : `Show L${L.id} in the chart`, action: () => { pushHistory(`${L.visible ? 'hide' : 'show'} L${L.id}`); L.visible = !L.visible; renderLegend(); showLinePanel(); drawLineChart(); requestRender(); } });
-    items.push({ label: `Copy L${L.id} samples (CSV)`, disabled: !L.data, action: () => copyText(lineCSV([L]), `L${L.id} samples copied`) });
-    items.push({ label: `Download L${L.id} samples (CSV)`, disabled: !L.data, action: () => download(`semview_${S.meta.name}_${S.field}_L${L.id}.csv`, lineCSV([L]), 'text/csv') });
-    items.push({ label: `Copy end points of L${L.id}`, action: () => copyText(`${L.x0}\t${L.y0}\n${L.x1}\t${L.y1}`, 'End points copied') });
-    items.push({ label: `Delete L${L.id}`, key: 'Del', action: () => removeLine(L) });
+    items.push({ header: `line ${lineName(L)}: (${fmt(L.x0, 5)}, ${fmt(L.y0, 5)}) → (${fmt(L.x1, 5)}, ${fmt(L.y1, 5)})` });
+    items.push({ label: L.visible ? `Hide ${lineName(L)} in the chart` : `Show ${lineName(L)} in the chart`, action: () => { pushHistory(`${L.visible ? 'hide' : 'show'} ${lineName(L)}`); L.visible = !L.visible; renderLegend(); showLinePanel(); drawLineChart(); requestRender(); } });
+    items.push({ label: `Copy ${lineName(L)} samples (CSV)`, disabled: !L.data, action: () => copyText(lineCSV([L]), `${lineName(L)} samples copied`) });
+    items.push({ label: `Download ${lineName(L)} samples (CSV)`, disabled: !L.data, action: () => download(`semview_${S.meta.name}_${S.field}_${lineName(L)}.csv`, lineCSV([L]), 'text/csv') });
+    items.push({ label: `Copy end points of ${lineName(L)}`, action: () => copyText(`${L.x0}\t${L.y0}\n${L.x1}\t${L.y1}`, 'End points copied') });
+    items.push({ label: `Delete ${lineName(L)}`, key: 'Del', action: () => removeLine(L) });
   }
+  const bhit = boundaryAt(px, py);
+  if (bhit) {
+    items.push('-');
+    items.push({ header: `boundary ${bhit.name}: ${bhit.edges.length} edge${bhit.edges.length === 1 ? '' : 's'}${bhit.source === 'auto' ? ' (detected)' : ' (manual)'}` });
+    items.push({ label: `Edit ${bhit.name} (pick edges)`, action: () => setPickMode(true, bhit) });
+    items.push({ label: bhit.visible ? `Hide ${bhit.name}` : `Show ${bhit.name}`, action: () => { pushHistory(`${bhit.visible ? 'hide' : 'show'} boundary ${bhit.name}`); bhit.visible = !bhit.visible; renderBoundaryList(); requestRender(); } });
+    items.push({ label: `Copy edges of ${bhit.name} (element, side)`, action: () => copyText('element\tside\n' + bhit.edges.map(i => `${S.mesh.elmap[BD.ext.ids[2 * i]]}\t${['bottom', 'right', 'top', 'left'][BD.ext.ids[2 * i + 1]]}`).join('\n'), 'Boundary edges copied') });
+    items.push({ label: `Delete ${bhit.name}`, action: () => removeBoundary(bhit) });
+  }
+  if (BD.pick) { items.push('-'); items.push({ label: 'Finish picking edges', key: 'Esc', action: () => setPickMode(false) }); }
   items.push('-');
   items.push({ label: 'Zoom to this element', disabled: !p, action: () => zoomToElement(p.e) });
   items.push({ label: 'Center view here', action: () => { pushHistory('center view'); S.view.cx = x; S.view.cy = y; requestRender(); updateProbe(); } });
@@ -1070,7 +1602,8 @@ lpc.addEventListener('contextmenu', ev => {
     { label: 'Download samples of visible lines (CSV)', disabled: !vis.length, action: () => download(`semview_${S.meta.name}_${S.field}_lines.csv`, lineCSV(vis), 'text/csv') },
     '-',
     { label: 'Reset zoom', key: 'double-click', action: resetChartZoom },
-    { label: 'Close and clear all lines', key: 'Esc', action: clearLines },
+    { label: 'Hide this window (lines are kept)', key: 'g', action: () => setLineWindow(false) },
+    { label: 'Delete all lines', disabled: !S.lines.length, action: clearLines },
   ];
   openCtx(items, ev.clientX, ev.clientY);
 });
@@ -1120,6 +1653,7 @@ $('btn-prev').onclick = () => setStep(S.step - 1);
 $('btn-next').onclick = () => setStep(S.step + 1);
 $('fps').onchange = () => { if (S.playing) setPlaying(true); };
 function setLineMode(on) {
+  if (on) { setPickMode(false); if (NL.mode) setNormalMode(false); }
   S.lineMode = on;
   $('btn-line').classList.toggle('active', on);
   glCanvas.style.cursor = on ? 'crosshair' : '';
@@ -1133,8 +1667,10 @@ $('btn-shot').onclick = screenshot;
 $('btn-open').onclick = openDialog;
 
 window.addEventListener('keydown', ev => {
-  if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT') return;
+  if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT' || ev.target.tagName === 'TEXTAREA') return;
   if (!$('dialog').hidden) { if (ev.key === 'Escape') closeDialog(); return; }
+  if (!$('save-dialog').hidden) { if (ev.key === 'Escape') closeSaveDialog(); return; }
+  if (!$('help-dialog').hidden) { if (ev.key === 'Escape') $('help-dialog').hidden = true; return; }
   switch (ev.key) {
     case ' ': ev.preventDefault(); setPlaying(!S.playing); break;
     case 'ArrowRight': setStep(S.step + 1); break;
@@ -1146,14 +1682,22 @@ window.addEventListener('keydown', ev => {
     case 'n': $('show-nodes').click(); break;
     case 'r': resetViewUser(); break;
     case 'z': case 'Z': if (ev.ctrlKey || ev.metaKey) { ev.preventDefault(); if (ev.shiftKey) redo(); else undo(); } else return; break;
+    case 'S': if (ev.ctrlKey || ev.metaKey) { ev.preventDefault(); openSaveDialog(); } else return; break;
     case 'y': case 'Y': if (ev.ctrlKey || ev.metaKey) { ev.preventDefault(); redo(); } else return; break;
-    case 's': screenshot(); break;
+    case 's': if (ev.ctrlKey || ev.metaKey) { ev.preventDefault(); openSaveDialog(); } else screenshot(); break;
     case 'o': openDialog(); break;
     case 'l': setLineMode(!S.lineMode); break;
+    case 'w': setNormalMode(!NL.mode); break;
+    case 'g': setLineWindow(!LP.windowOpen); break;
+    case 'b': toggleSidebar(); break;
     case 'Escape':
       if (!ctxEl.hidden) { closeCtx(); break; }
       if (S.drag && S.drag.kind === 'line') { removeLine(S.drag.line, false); S.drag = null; glCanvas.style.cursor = ''; break; }
-      S.probePinned = null; clearLines(); requestRender(); break;
+      if (BD.pick) { setPickMode(false); break; }
+      if (NL.mode) { setNormalMode(false); break; }
+      if (S.lineMode) { setLineMode(false); break; }
+      if (S.probePinned) { pushHistory('unpin probe'); S.probePinned = null; updateProbe(); requestRender(); }
+      break;
     case 'Delete': case 'Backspace': { const L = activeLine(); if (L) removeLine(L); break; }
     case '1': case '2': $('mode').querySelector(`[data-mode="${+ev.key - 1}"]`).click(); break;
     default: return;
@@ -1191,7 +1735,7 @@ async function browse(dir) {
     for (const e of d.entries) {
       const li = document.createElement('li');
       li.className = e.type;
-      const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = e.type === 'dir' ? 'dir' : e.type === 'meta' ? 'series' : 'field';
+      const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = e.type === 'dir' ? 'dir' : e.type === 'meta' ? 'series' : e.type === 'session' ? 'session' : 'field';
       li.appendChild(tag);
       const nm = document.createElement('span'); nm.textContent = e.name; li.appendChild(nm);
       if (e.size !== undefined) { const sz = document.createElement('span'); sz.className = 'size'; sz.textContent = e.size > 1e6 ? (e.size / 1e6).toFixed(1) + ' MB' : (e.size / 1e3).toFixed(0) + ' kB'; li.appendChild(sz); }
@@ -1205,15 +1749,17 @@ function closeDialog() { $('dialog').hidden = true; }
 $('dlg-close').onclick = closeDialog;
 $('dialog').addEventListener('click', ev => { if (ev.target === $('dialog')) closeDialog(); });
 $('dlg-up').onclick = () => browse($('dlg-path').dataset.parent);
-$('dlg-go').onclick = () => { const p = $('dlg-path').value.trim(); if (/\.nek5000$|\d\.f\d{5}$/.test(p)) openPath(p); else browse(p); };
+$('dlg-go').onclick = () => { const p = $('dlg-path').value.trim(); if (/\.nek5000$|\d\.f\d{5}$|\.semview\.json$/.test(p)) openPath(p); else browse(p); };
 $('dlg-path').addEventListener('keydown', ev => { if (ev.key === 'Enter') $('dlg-go').click(); });
 
-async function openPath(path) {
+async function openPath(path, opts = {}) {
   closeDialog();
+  if (path.endsWith(SESSION_SUFFIX)) return loadSessionPath(path);
   toast(`Opening ${path.split('/').pop()} …`);
   try {
     setPlaying(false);
     S.probePinned = null; clearLines(false); clearHistory();
+    setPickMode(false); setNormalMode(false); NL.length = null; $('nl-length').value = ''; S.boundaries = []; BD.ext = null; BD.groups = null; renderBoundaryList();
     S.meta = await api('open', { path });
     S.fieldCache.clear();
     await loadMesh();
@@ -1221,8 +1767,228 @@ async function openPath(path) {
     setupTime();
     fitView();
     await loadField();
-    toast(`Loaded ${S.meta.name}: ${S.meta.nelv.toLocaleString()} elements, N = ${S.meta.order}`);
+    if (!opts.quiet) toast(`Loaded ${S.meta.name}: ${S.meta.nelv.toLocaleString()} elements, N = ${S.meta.order}`);
   } catch (err) { toast(err.message, true); }
+}
+
+// ----------------------------------------------------------------- sessions
+const SESSION_SUFFIX = '.semview.json';
+
+function sessionState() {
+  const [x0, y0] = screenToData(0, H()), [x1, y1] = screenToData(W(), 0);
+  const p = $('line-panel');
+  return {
+    semview_session: 1,
+    saved: new Date().toISOString(),
+    dataset: { path: S.meta.path, step: S.step },
+    field: { name: S.field, cmap: S.cmap, invert: S.invert, range: { ...S.range } },
+    render: { mode: S.mode, edges: S.edges, edgeWidth: S.edgeWidth, contours: S.contours, nContours: S.nContours, nodes: S.nodes, nodeSize: S.nodeSize, axes: S.axes, colorbar: S.colorbar, pxPerCell: S.pxPerCell, bg: S.bg },
+    view: { cx: S.view.cx, cy: S.view.cy, scale: S.view.scale, xlim: [x0, x1], ylim: [y0, y1] },
+    probe: { pinned: S.probePinned ? { ...S.probePinned } : null, snapAngle: S.snapAngle },
+    lines: S.lines.map(L => ({ id: L.id, colorIdx: L.colorIdx, kind: L.kind || 'line', anchor: L.anchor || null, x0: L.x0, y0: L.y0, x1: L.x1, y1: L.y1, visible: L.visible })),
+    normalLength: NL.length,
+    normalSnap: NL.snap,
+    activeLine: LP.active,
+    boundaries: BD.ext ? S.boundaries.map(b => ({ name: b.name, colorIdx: b.colorIdx, source: b.source, visible: b.visible, closed: !!b.closed, edges: b.edges.map(i => [BD.ext.ids[2 * i], BD.ext.ids[2 * i + 1]]) })) : [],
+    boundaryAngle: BD.angle,
+    showBoundaries: S.showBoundaries,
+    chart: { open: !p.hidden, left: parseFloat(p.style.left) || null, top: parseFloat(p.style.top) || null, width: p.offsetWidth, height: p.offsetHeight, grid: LP.showGrid, elem: LP.showElem, xview: LP.xview, yview: LP.yview },
+  };
+}
+
+const setCheck = (id, v) => { const el = $(id); if (el && v !== undefined) el.checked = !!v; };
+const setVal = (id, v) => { const el = $(id); if (el && v !== undefined && v !== null) el.value = v; };
+
+/** Apply a session; opens its dataset first when it differs from the current one. */
+async function applySession(sess) {
+  if (!sess || !sess.dataset) { toast('Not a semview session', true); return; }
+  if (!S.meta || !S.meta.open || S.meta.path !== sess.dataset.path) {
+    await openPath(sess.dataset.path, { quiet: true });
+    if (!S.meta || S.meta.path !== sess.dataset.path) return;   // open failed (toast shown)
+  }
+  setPlaying(false);
+  const f = sess.field || {}, r = sess.render || {}, v = sess.view || {}, pr = sess.probe || {}, ch = sess.chart || {};
+  // rendering options
+  if (r.bg && BG[r.bg]) { S.bg = r.bg; setVal('bg', r.bg); document.body.classList.toggle('light', isLight()); }
+  if (r.mode !== undefined) { S.mode = +r.mode; for (const o of $('mode').querySelectorAll('button')) o.classList.toggle('on', +o.dataset.mode === S.mode); }
+  for (const [k, id] of [['edges', 'show-edges'], ['contours', 'show-contours'], ['nodes', 'show-nodes'], ['axes', 'show-axes'], ['colorbar', 'show-colorbar']]) if (r[k] !== undefined) { S[k] = !!r[k]; setCheck(id, r[k]); }
+  for (const [k, id] of [['edgeWidth', 'edge-width'], ['nContours', 'n-contours'], ['nodeSize', 'node-size'], ['pxPerCell', 'quality']]) if (r[k] !== undefined) { S[k] = +r[k]; setVal(id, r[k]); }
+  // field, colormap, range
+  if (f.cmap && S.colormaps[f.cmap]) { S.cmap = f.cmap; setVal('cmap', f.cmap); R.setColormap(S.colormaps[S.cmap]); }
+  if (f.invert !== undefined) { S.invert = !!f.invert; setCheck('cmap-invert', f.invert); }
+  if (f.range) { S.range = { ...S.range, ...f.range }; setCheck('range-auto', S.range.auto); setCheck('range-sym', S.range.sym); }
+  S.step = clamp(+(sess.dataset.step || 0), 0, S.meta.nsteps - 1);
+  $('step-slider').value = S.step;
+  if (f.name && S.meta.available.includes(f.name) || (f.name || '').startsWith('decay:')) { S.field = f.name; setVal('field', f.name); }
+  await loadField();
+  if (f.range && !S.range.auto) setRange(f.range.lo, f.range.hi, false);
+  // view: refit the stored extent to the current canvas
+  if (v.xlim && v.ylim && W() > 1 && H() > 1) {
+    const sx = W() / Math.max(v.xlim[1] - v.xlim[0], 1e-300), sy = H() / Math.max(v.ylim[1] - v.ylim[0], 1e-300);
+    S.view = { cx: 0.5 * (v.xlim[0] + v.xlim[1]), cy: 0.5 * (v.ylim[0] + v.ylim[1]), scale: Math.min(sx, sy) };
+  } else if (v.cx !== undefined) S.view = { cx: v.cx, cy: v.cy, scale: v.scale };
+  // probes and lines
+  S.probePinned = pr.pinned ? { x: pr.pinned.x, y: pr.pinned.y } : null;
+  if (pr.snapAngle !== undefined) { S.snapAngle = !!pr.snapAngle; setCheck('snap-angle', pr.snapAngle); }
+  S.lines = (sess.lines || []).map((L, i) => ({ id: L.id || i + 1, colorIdx: L.colorIdx ?? i, kind: L.kind || 'line', anchor: L.anchor || null, x0: L.x0, y0: L.y0, x1: L.x1, y1: L.y1, visible: L.visible !== false, data: null, field: null, step: null, hoverIdx: null, token: 0 }));
+  if (sess.normalLength !== undefined && sess.normalLength !== null) { NL.length = +sess.normalLength; setVal('nl-length', NL.length); }
+  if (sess.normalSnap !== undefined) { NL.snap = !!sess.normalSnap; setCheck('nl-snap', NL.snap); }
+  LP.nextId = Math.max(1, ...S.lines.map(L => L.id + 1));
+  LP.active = S.lines.some(L => L.id === sess.activeLine) ? sess.activeLine : (S.lines.length ? S.lines[S.lines.length - 1].id : null);
+  LP.showGrid = ch.grid !== false; setCheck('lp-grid', LP.showGrid);
+  LP.showElem = ch.elem !== false; setCheck('lp-elem', LP.showElem);
+  LP.xview = ch.xview || null; LP.yview = ch.yview || null;
+  const p = $('line-panel');
+  if (ch.width) p.style.width = ch.width + 'px';
+  if (ch.height) p.style.height = ch.height + 'px';
+  if (ch.left != null) p.style.left = ch.left + 'px';
+  if (ch.top != null) p.style.top = ch.top + 'px';
+  renderLegend();
+  setLineWindow(ch.open === true || (ch.open === undefined && S.lines.length > 0));
+  for (const L of S.lines) runLine(L);
+  // boundaries
+  setPickMode(false);
+  if (sess.boundaryAngle !== undefined) { BD.angle = +sess.boundaryAngle; setVal('bd-angle', BD.angle); }
+  if (sess.showBoundaries !== undefined) { S.showBoundaries = !!sess.showBoundaries; setCheck('bd-show', S.showBoundaries); }
+  S.boundaries = [];
+  if (sess.boundaries && sess.boundaries.length) {
+    try {
+      const E = await loadBoundaryEdges();
+      for (const sb of sess.boundaries) {
+        const b = newBoundary(sb.source || 'manual', sb.name);
+        if (sb.colorIdx !== undefined) b.colorIdx = sb.colorIdx;
+        b.visible = sb.visible !== false; b.closed = !!sb.closed;
+        b.edges = (sb.edges || []).map(([e, sd]) => E.index.get(`${e}:${sd}`)).filter(i => i !== undefined);
+      }
+    } catch (err) { toast('Boundaries not restored: ' + err.message, true); }
+  }
+  renderBoundaryList();
+  clearHistory();
+  updateProbe();
+  requestRender();
+  toast(`Session restored: ${S.meta.name}, ${S.field}` + (S.lines.length ? `, ${S.lines.length} line${S.lines.length === 1 ? '' : 's'}` : ''));
+}
+
+function defaultSessionPath() {
+  if (!S.meta || !S.meta.open) return '';
+  const dir = S.meta.path.split('/').slice(0, -1).join('/');
+  return `${dir}/${S.meta.name}${SESSION_SUFFIX}`;
+}
+function openSaveDialog() {
+  if (!S.meta || !S.meta.open) { toast('Open a dataset first', true); return; }
+  $('save-dialog').hidden = false;
+  if (!$('sdlg-path').value) $('sdlg-path').value = defaultSessionPath();
+  $('sdlg-path').focus();
+}
+const closeSaveDialog = () => { $('save-dialog').hidden = true; };
+async function saveSessionTo(path, overwrite = false) {
+  const res = await fetch(`/api/session/save?path=${encodeURIComponent(path)}&overwrite=${overwrite ? 1 : 0}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sessionState()) });
+  const out = await res.json();
+  if (res.status === 409 && out.exists) {
+    if (confirm(`${path} exists. Overwrite?`)) return saveSessionTo(path, true);
+    return;
+  }
+  if (!res.ok) throw new Error(out.error || res.statusText);
+  closeSaveDialog();
+  toast(`Session saved: ${out.path}`);
+}
+$('btn-save-session').onclick = openSaveDialog;
+$('sdlg-close').onclick = closeSaveDialog;
+$('save-dialog').addEventListener('click', ev => { if (ev.target === $('save-dialog')) closeSaveDialog(); });
+$('sdlg-save').onclick = () => { const p = $('sdlg-path').value.trim(); if (!p) return; saveSessionTo(p).catch(err => toast(err.message, true)); };
+$('sdlg-path').addEventListener('keydown', ev => { if (ev.key === 'Enter') $('sdlg-save').click(); if (ev.key === 'Escape') closeSaveDialog(); });
+$('sdlg-download').onclick = () => { download(`${S.meta.name}${SESSION_SUFFIX}`, JSON.stringify(sessionState(), null, 2), 'application/json'); closeSaveDialog(); };
+$('dlg-import').addEventListener('change', async ev => {
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = '';
+  if (!file) return;
+  try {
+    const sess = JSON.parse(await file.text());
+    if (!sess.semview_session) throw new Error(`${file.name} is not a semview session`);
+    closeDialog();
+    await applySession(sess);
+  } catch (err) { toast(err.message, true); }
+});
+async function loadSessionPath(path) {
+  closeDialog();
+  toast(`Loading session ${path.split('/').pop()} …`);
+  try {
+    setPlaying(false);
+    S.probePinned = null; clearLines(false); clearHistory();
+    setPickMode(false); setNormalMode(false); S.boundaries = []; BD.groups = null; renderBoundaryList();
+    const meta = await api('session/load', { path });
+    if (!(S.meta && S.meta.open && S.meta.path === meta.path)) BD.ext = null;
+    const sameDataset = S.meta && S.meta.open && S.meta.path === meta.path;
+    S.meta = meta;
+    if (!sameDataset) { S.fieldCache.clear(); await loadMesh(); populateFields(); setupTime(); fitView(); }
+    await applySession(meta.session);
+  } catch (err) { toast(err.message, true); }
+}
+
+// ----------------------------------------------------------------- top menu
+function toggleSidebar() { $('app').classList.toggle('no-sidebar'); requestRender(); }
+const SHORTCUTS = [
+  ['wheel / drag', 'zoom / pan'], ['double-click', 'reset view'], ['right-click', 'context menu'],
+  ['hover / click', 'probe / pin probe'], ['Shift-drag or l', 'line probe'], ['w', 'wall-normal line'],
+  ['Ctrl while dragging', 'snap line angle to 10°'], ['Del', 'delete selected line'], ['g', 'line chart window'],
+  ['b', 'sidebar'], ['Space, ← →, Home, End', 'time steps'], ['1 / 2', 'spectral / nodal rendering'],
+  ['m, c, n', 'element edges, iso-lines, GLL nodes'], ['r', 'reset view'], ['s', 'screenshot'],
+  ['o', 'open dataset or session'], ['Ctrl+S', 'save session'], ['Ctrl+Z / Ctrl+Shift+Z', 'undo / redo'], ['Esc', 'leave a mode / unpin probe'],
+];
+function showHelp() {
+  const w = Math.max(...SHORTCUTS.map(([k]) => k.length));
+  $('help-body').textContent = SHORTCUTS.map(([k, v]) => `${k.padEnd(w + 2)}${v}`).join('\n');
+  $('help-dialog').hidden = false;
+}
+$('help-close').onclick = () => { $('help-dialog').hidden = true; };
+$('help-dialog').addEventListener('click', ev => { if (ev.target === $('help-dialog')) $('help-dialog').hidden = true; });
+
+function menuItems(name) {
+  const open = !!(S.meta && S.meta.open);
+  if (name === 'file') return [
+    { label: 'Open dataset or session…', key: 'o', action: openDialog },
+    { label: 'Reload dataset', disabled: !open, action: () => openPath(S.meta.path) },
+    '-',
+    { label: 'Save session…', key: 'Ctrl+S', disabled: !open, action: openSaveDialog },
+    { label: 'Download session', disabled: !open, action: () => download(`${S.meta.name}${SESSION_SUFFIX}`, JSON.stringify(sessionState(), null, 2), 'application/json') },
+    '-',
+    { label: 'Save screenshot (PNG)', key: 's', disabled: !open, action: screenshot },
+    { label: 'Copy Python snippet of this view', disabled: !open, action: () => copyText(pythonSnippet(), 'Python snippet copied') },
+  ];
+  if (name === 'view') return [
+    { label: 'Reset view', key: 'r', disabled: !open, action: resetViewUser },
+    '-',
+    { label: 'Line chart window', key: 'g', checked: LP.windowOpen, action: () => setLineWindow(!LP.windowOpen) },
+    { label: 'Sidebar', key: 'b', checked: !$('app').classList.contains('no-sidebar'), action: toggleSidebar },
+    '-',
+    { label: 'Axes', checked: S.axes, action: () => $('show-axes').click() },
+    { label: 'Colorbar', checked: S.colorbar, action: () => $('show-colorbar').click() },
+    { label: 'Element edges', key: 'm', checked: S.edges, action: () => $('show-edges').click() },
+    { label: 'Iso-lines', key: 'c', checked: S.contours, action: () => $('show-contours').click() },
+    { label: 'GLL nodes', key: 'n', checked: S.nodes, action: () => $('show-nodes').click() },
+    { label: 'Boundaries', checked: S.showBoundaries, action: () => $('bd-show').click() },
+    '-',
+    { label: 'Spectral rendering (exact per pixel)', key: '1', checked: S.mode === 0, action: () => $('mode').querySelector('[data-mode="0"]').click() },
+    { label: 'Nodal rendering (linear, fast)', key: '2', checked: S.mode === 1, action: () => $('mode').querySelector('[data-mode="1"]').click() },
+    '-',
+    { label: 'Light background', checked: isLight(), action: () => { $('bg').value = isLight() ? 'dark' : 'light'; $('bg').dispatchEvent(new Event('change')); } },
+  ];
+  return [
+    { label: 'Keyboard and mouse…', action: showHelp },
+    { label: 'About semview', action: () => toast('semview — spectral-element-aware viewer for 2D CG SEM data (Nek5000 / Neko), built on pySEMTools') },
+  ];
+}
+function openMenu(btn) {
+  const name = btn.dataset.menu;
+  const rect = btn.getBoundingClientRect();
+  openCtx(menuItems(name), rect.left, rect.bottom + 2);
+  ctxEl.dataset.menu = name;
+  btn.classList.add('open');
+}
+for (const btn of document.querySelectorAll('.menu-btn')) {
+  btn.addEventListener('mousedown', ev => ev.stopPropagation());
+  btn.addEventListener('click', () => { if (!ctxEl.hidden && ctxEl.dataset.menu === btn.dataset.menu) closeCtx(); else { closeCtx(); openMenu(btn); } });
+  btn.addEventListener('mouseenter', () => { if (!ctxEl.hidden && ctxEl.dataset.menu && ctxEl.dataset.menu !== btn.dataset.menu) { closeCtx(); openMenu(btn); } });
 }
 
 // ----------------------------------------------------------------- misc
@@ -1235,7 +2001,7 @@ function toast(msg, error = false) {
 }
 
 // ----------------------------------------------------------------- boot
-window.semview = { S, R, api, requestRender, pythonSnippet, lineCSV };   // handy for debugging / scripting the GUI
+window.semview = { S, R, BD, NL, boundaryNodeAt, boundaryPointAt, edgePoint, createNormalLine, setNormalMode, api, requestRender, pythonSnippet, lineCSV, sessionState, applySession, detectBoundaries, setPickMode, toggleEdge, edgeAt };   // handy for debugging / scripting the GUI
 (async () => {
   try {
     resize();

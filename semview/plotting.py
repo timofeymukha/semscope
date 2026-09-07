@@ -124,6 +124,18 @@ class Plotter:
         self._layers.append(_Layer("points", None, dict(x=np.asarray(x), y=np.asarray(y), color=color, size=size, marker=marker, zorder=zorder, kw=kw)))
         return self
 
+    def add_boundaries(self, data: SEMData2D, boundaries=None, colors=None, linewidth=2.0, labels=True, resolution: int = 12, zorder=7.5, angle: float = 90.0) -> "Plotter":
+        """Draw mesh boundaries (auto-detected with ``angle`` when ``boundaries`` is None), each in its own colour."""
+        if boundaries is None:
+            boundaries = data.detect_boundaries(angle)
+        self._layers.append(_Layer("boundaries", data, dict(boundaries=list(boundaries), colors=colors, linewidth=linewidth, labels=labels, resolution=resolution, zorder=zorder)))
+        return self
+
+    def add_segments(self, segments, color="white", linewidth=1.0, alpha=1.0, zorder=8.0, **kw) -> "Plotter":
+        """Draw straight segments ``[((x0, y0), (x1, y1)), ...]`` (e.g. line-probe locations)."""
+        self._layers.append(_Layer("segments", None, dict(segments=[(tuple(a), tuple(b)) for a, b in segments], color=color, linewidth=linewidth, alpha=alpha, zorder=zorder, kw=kw)))
+        return self
+
     # ------------------------------------------------------------ view
     def set_view(self, xlim=None, ylim=None) -> "Plotter":
         self._view = (tuple(xlim) if xlim is not None else None, tuple(ylim) if ylim is not None else None)
@@ -375,6 +387,32 @@ class Plotter:
         ids = data.elmap[vis] if (o["use_global"] and data.elmap is not None) else vis + data.offset_el
         for e, x, y in zip(ids, cx, cy):
             self._artists.append(self.ax.text(x, y, str(int(e)), fontsize=o["fontsize"], color=o["color"], ha="center", va="center", zorder=o["zorder"]))
+
+    def _render_boundaries(self, L: _Layer, xlim, ylim):
+        from matplotlib.collections import LineCollection
+
+        o = L.opts
+        colors = o["colors"] or ["#f97316", "#22c55e", "#a855f7", "#ef4444", "#06b6d4", "#eab308", "#ec4899", "#84cc16"]
+        for k, b in enumerate(o["boundaries"]):
+            col = colors[k % len(colors)]
+            segs = b.coords(o["resolution"])
+            lc = LineCollection(list(segs), colors=col, linewidths=o["linewidth"], zorder=o["zorder"], capstyle="round")
+            self.ax.add_collection(lc)
+            self._artists.append(lc)
+            if o["labels"]:
+                mid = segs[len(segs) // 2]
+                p = mid[len(mid) // 2]
+                self._artists.append(self.ax.annotate(b.name, p, xytext=(4, 4), textcoords="offset points", fontsize=7, color=col, zorder=o["zorder"] + 0.1))
+
+    def _render_segments(self, L: _Layer, xlim, ylim):
+        from matplotlib.collections import LineCollection
+
+        o = L.opts
+        lc = LineCollection(o["segments"], colors=o["color"], linewidths=o["linewidth"], alpha=o["alpha"], zorder=o["zorder"], **o["kw"])
+        self.ax.add_collection(lc)
+        self._artists.append(lc)
+        for (x0, y0), (x1, y1) in o["segments"]:
+            self._artists.append(self.ax.scatter([x0, x1], [y0, y1], s=12, c=o["color"], zorder=o["zorder"], linewidths=0))
 
     def _render_points(self, L: _Layer, xlim, ylim):
         o = L.opts

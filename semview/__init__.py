@@ -25,6 +25,7 @@ _warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array",
 
 from .dataset import SEMData2D, Dataset, open, load, DERIVED_QUANTITIES  # noqa: F401,E402
 from .locate import ElementLocator  # noqa: F401,E402
+from .boundary import Boundary  # noqa: F401,E402
 from . import spectral  # noqa: F401,E402
 
 __version__ = "0.1.0"
@@ -43,4 +44,4 @@ def __getattr__(name):
     raise AttributeError(name)
 
 
-__all__ = ["SEMData2D", "Dataset", "open", "load", "Plotter", "serve", "spectral", "ElementLocator", "DERIVED_QUANTITIES"]
+__all__ = ["SEMData2D", "Dataset", "open", "load", "Plotter", "serve", "spectral", "ElementLocator", "Boundary", "DERIVED_QUANTITIES"]

@@ -12,7 +12,7 @@ def main(argv=None) -> int:
         description="Spectral-element-aware viewer for 2D Nek5000/Neko field files. "
         "Opens a browser GUI; run under mpirun to read large files in parallel.",
     )
-    p.add_argument("file", nargs="?", help=".nek5000 metafile, a case0.f00000 field file, or a glob")
+    p.add_argument("file", nargs="?", help=".nek5000 metafile, a case0.f00000 field file, a glob, or a saved *.semview.json session")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--no-browser", action="store_true", help="do not open a browser window")
@@ -29,6 +29,19 @@ def main(argv=None) -> int:
             p.error("a FILE is required")
         import semview
 
+        if args.png and args.file.endswith(".semview.json"):
+            from semview.session import plotter_from_session
+
+            pl, data = plotter_from_session(args.file)
+            if pl is None:  # non-root MPI rank
+                return 0
+            pl.save(args.png)
+            print(f"wrote {args.png} from session {args.file}")
+            return 0
+        if args.file.endswith(".semview.json"):
+            from semview.session import load_session
+
+            args.file = load_session(args.file)["dataset"]["path"]
         ds = semview.open(args.file)
         data = ds[args.step].gather(ds.comm)
         if data is None:  # non-root MPI rank

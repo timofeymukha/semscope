@@ -261,6 +261,46 @@ class SEMData2D:
         XG, YG = np.meshgrid(xg, yg)
         return xg, yg, self.sample(names, XG, YG, fill_value=fill_value)
 
+    # ------------------------------------------------------------ boundaries
+    def external_edges(self) -> np.ndarray:
+        """Element edges not shared with another element, ``(nb, 2)`` of ``(elem, side)``."""
+        if "external_edges" not in self._cache:
+            from .boundary import external_edges
+
+            self._cache["external_edges"] = external_edges(self.x, self.y)
+        return self._cache["external_edges"]
+
+    def detect_boundaries(self, angle: float = 90.0):
+        """Boundaries: external edges chained and split at corners sharper than ``angle`` degrees."""
+        from .boundary import detect_boundaries
+
+        return detect_boundaries(self.x, self.y, angle=angle, edges=self.external_edges())
+
+    def boundary(self, edges, name: str = "boundary"):
+        """A :class:`~semview.boundary.Boundary` from explicit ``(elem, side)`` pairs (chained if possible)."""
+        from .boundary import Boundary, chain_edges
+
+        edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+        closed = False
+        if len(edges) > 1:
+            loops = chain_edges(self.x, self.y, edges)
+            if len(loops) == 1:
+                edges = edges[loops[0][0]]
+                closed = loops[0][1]
+        return Boundary(name, edges, closed=closed, x=self.x, y=self.y)
+
+    def normal_line(self, elem: int, side: int, node: int, length: float):
+        """Wall-normal probe segment ``(p0, p1)`` starting at a boundary GLL node (see :func:`semview.boundary.normal_line`)."""
+        from .boundary import normal_line
+
+        return normal_line(self.x, self.y, int(elem), int(side), int(node), float(length))
+
+    def normal_line_at(self, elem: int, side: int, t: float, length: float):
+        """Wall-normal probe segment from the point at parameter ``t`` in ``[-1, 1]`` along a boundary edge."""
+        from .boundary import normal_line_at
+
+        return normal_line_at(self.x, self.y, int(elem), int(side), float(t), float(length))
+
     def spectral_decay(self, name: str) -> np.ndarray:
         """Per-element ratio of the energy in the highest Legendre mode to the total.
 
