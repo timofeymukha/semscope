@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semview"
+version = "0.1.0"
+description = "Spectral-element-aware visualization of 2D CG SEM data (Nek5000/Neko) with a scripting API and a WebGL GUI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Timofey Mukha" }]
+dependencies = [
+    "numpy",
+    "mpi4py",
+    "extremeflow-pysemtools",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib"]
+test = ["pytest", "matplotlib", "scipy"]
+
+[project.scripts]
+semview = "semview.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["semview*"]
+
+[tool.setuptools.package-data]
+"semview.gui" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

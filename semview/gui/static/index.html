@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>semview</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <header id="brand">
+      <div class="logo"><span class="logo-mark"></span>semview</div>
+      <div class="tagline">spectral-element viewer</div>
+    </header>
+
+    <section class="panel">
+      <h2>Data</h2>
+      <div class="row">
+        <button id="btn-open" class="btn primary" title="Open a .nek5000 metafile or field file">Open…</button>
+        <button id="btn-reload" class="btn" title="Re-read the current dataset (R)">Reload</button>
+      </div>
+      <div id="file-info" class="info muted">No dataset loaded</div>
+      <div id="time-block" hidden>
+        <div class="row space">
+          <label>step <span id="step-label" class="mono">0</span> / <span id="step-max" class="mono">0</span></label>
+          <span class="mono" id="time-label">t = 0</span>
+        </div>
+        <input type="range" id="step-slider" min="0" max="0" value="0" step="1">
+        <div class="row transport">
+          <button id="btn-first" class="btn icon" title="First step (Home)">⏮</button>
+          <button id="btn-prev" class="btn icon" title="Previous step (←)">◂</button>
+          <button id="btn-play" class="btn icon" title="Play / pause (Space)">▶</button>
+          <button id="btn-next" class="btn icon" title="Next step (→)">▸</button>
+          <button id="btn-last" class="btn icon" title="Last step (End)">⏭</button>
+          <select id="fps" title="Playback speed">
+            <option value="2">2 fps</option><option value="5">5 fps</option><option value="10" selected>10 fps</option><option value="20">20 fps</option><option value="60">max</option>
+          </select>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Field</h2>
+      <div class="grid2">
+        <label for="field">variable</label>
+        <select id="field"></select>
+        <label for="cmap">colormap</label>
+        <select id="cmap"></select>
+      </div>
+      <div class="row space" style="margin-top:8px">
+        <label class="check"><input type="checkbox" id="range-auto" checked> auto range</label>
+        <label class="check"><input type="checkbox" id="range-sym"> symmetric</label>
+        <label class="check"><input type="checkbox" id="cmap-invert"> invert</label>
+      </div>
+      <div class="grid2 compact">
+        <label for="vmin">min</label><input type="text" id="vmin" class="mono">
+        <label for="vmax">max</label><input type="text" id="vmax" class="mono">
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Rendering</h2>
+      <div class="seg" id="mode">
+        <button data-mode="0" class="on" title="Evaluate the polynomial basis at every pixel">spectral</button>
+        <button data-mode="1" title="Linear interpolation between GLL nodes (what generic VTK viewers do)">nodal (linear)</button>
+      </div>
+      <div class="grid2 render" style="margin-top:8px">
+        <label class="check"><input type="checkbox" id="show-edges" checked> element edges</label>
+        <input type="range" id="edge-width" min="0.5" max="4" step="0.25" value="1" title="edge width (px)">
+        <label class="check"><input type="checkbox" id="show-contours"> iso-lines</label>
+        <input type="range" id="n-contours" min="2" max="60" step="1" value="12" title="number of iso-levels">
+        <label class="check"><input type="checkbox" id="show-nodes"> GLL nodes</label>
+        <input type="range" id="node-size" min="1" max="8" step="0.5" value="3" title="node size (px)">
+        <label class="check"><input type="checkbox" id="show-axes" checked> axes</label>
+        <label class="check"><input type="checkbox" id="show-colorbar" checked> colorbar</label>
+      </div>
+      <div class="grid2" style="margin-top:6px">
+        <label for="quality">tessellation</label>
+        <select id="quality" title="Sub-cell size used to tessellate curved element geometry (the field itself is always evaluated per pixel)">
+          <option value="16">coarse (16 px)</option>
+          <option value="8" selected>normal (8 px)</option>
+          <option value="4">fine (4 px)</option>
+          <option value="2">ultra (2 px)</option>
+        </select>
+        <label for="bg">background</label>
+        <select id="bg"><option value="dark" selected>dark</option><option value="light">light</option><option value="black">black</option><option value="white">white</option></select>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Probe <span class="hint">hover · click to pin · shift-drag for a line</span></h2>
+      <div id="probe" class="probe mono muted">—</div>
+      <div class="row" style="margin-top:6px">
+        <button id="btn-line" class="btn small" title="Line probe: drag across the domain to sample the field exactly along a segment (L). Drag the end points of an existing line to move them.">Line probe</button>
+        <button id="btn-clear-probe" class="btn small" title="Clear pinned probe and all lines (Esc)">Clear</button>
+      </div>
+      <label class="check" style="margin-top:6px" title="Constrain the line angle to multiples of 10° while drawing or moving an end point. Holding Ctrl does the same temporarily."><input type="checkbox" id="snap-angle"> snap angle to 10° (or hold Ctrl)</label>
+    </section>
+
+    <section class="panel">
+      <div class="row">
+        <button id="btn-reset" class="btn" title="Reset view (Home / double-click)">Reset view</button>
+        <button id="btn-shot" class="btn" title="Save a PNG of the current view (S)">Screenshot</button>
+      </div>
+      <div class="keys muted">wheel: zoom · drag: pan · right-click: menu · Ctrl+Z / Ctrl+Shift+Z: undo / redo · space: play · ←/→: step · m: edges · c: iso-lines · n: nodes · l: line probe · Del: remove line</div>
+    </section>
+  </aside>
+
+  <main id="view">
+    <canvas id="gl"></canvas>
+    <canvas id="overlay"></canvas>
+    <div id="status" class="mono"></div>
+    <div id="toast" hidden></div>
+    <div id="ctx" class="ctx" hidden></div>
+    <div id="line-panel" hidden>
+      <div class="lp-head" id="lp-head">
+        <span id="lp-title" class="mono grow" title="drag to move the panel"></span>
+        <span id="lp-info" class="mono muted"></span>
+        <button id="lp-reset" class="btn icon" title="Reset zoom (double-click on the chart)">⟲</button>
+        <button id="lp-close" class="btn icon" title="Close (Esc)">✕</button>
+      </div>
+      <div class="lp-legend">
+        <span id="lp-legend" class="lp-lines"></span>
+        <span class="lp-opts">
+          <label class="check" title="Faint grid lines at the axis ticks"><input type="checkbox" id="lp-grid" checked> grid</label>
+          <label class="check" title="Vertical markers where the selected line crosses from one element into the next"><input type="checkbox" id="lp-elem" checked> element bounds</label>
+        </span>
+      </div>
+      <div class="lp-body"><canvas id="lp-canvas" title="wheel: zoom distance · shift+wheel: zoom value · drag: pan · double-click: reset"></canvas></div>
+    </div>
+  </main>
+</div>
+
+<div id="dialog" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>Open dataset</h3>
+      <button id="dlg-close" class="btn icon">✕</button>
+    </div>
+    <div class="row">
+      <input type="text" id="dlg-path" class="mono grow" placeholder="/path/to/case0.nek5000">
+      <button id="dlg-go" class="btn">Go</button>
+      <button id="dlg-up" class="btn" title="Parent directory">↑</button>
+    </div>
+    <ul id="dlg-list" class="filelist"></ul>
+    <div class="modal-foot muted">Select a <b>.nek5000</b> metafile (time series) or a single <b>case0.f00000</b> field file.</div>
+  </div>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>
