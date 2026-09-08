@@ -28,6 +28,7 @@ import numpy as np
 from .. import mpi
 from .. import spectral as sp
 from ..boundary import detect_boundaries, edge_nodes, edge_normals
+from ..calc import ExpressionError, syntax_help
 from ..dataset import Dataset, SEMData2D
 from ..session import SESSION_SUFFIX, load_session, save_session
 
@@ -142,7 +143,8 @@ class DataService:
             "order": int(d0.order),
             "fields": d0.field_names,
             "available": d0.available,
-            "derived": {k: v for k, v in _derived_descriptions(d0).items()},
+            "calc": self.ds.expressions.to_list(),
+            "calc_syntax": syntax_help(),
             "bounds": list(d0.bounds),
             "gll": sp.gll_nodes(d0.n).tolist(),
             "bary": sp.barycentric_weights(sp.gll_nodes(d0.n)).tolist(),
@@ -162,14 +164,46 @@ class DataService:
 
     def field(self, name: str, step: int):
         d = self.get_step(step)
-        if name.startswith("decay:"):
-            per_elem = d.spectral_decay(name[6:])
-            arr = np.log10(np.maximum(per_elem, 1e-16))[:, None, None] * np.ones((1, d.n, d.n))
-        else:
-            arr = d[name]
-        finite = arr[np.isfinite(arr)]
-        lo, hi = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
+        arr = d[name]
+        lo, hi = _finite_range(arr)
         return np.ascontiguousarray(arr, dtype="<f4").tobytes(), {"time": d.time, "min": lo, "max": hi}
+
+    # ------------------------------------------------------------ field calculator
+    def calc_define(self, name: str, expr: str, step: int = 0) -> dict:
+        """Add or replace a calculator field; evaluates it once on ``step`` to report its range."""
+        if self.ds is None:
+            raise RuntimeError("no dataset open")
+        with self.lock:
+            previous = self.ds.expressions.get(name)
+            name = self.ds.define(name, expr)
+            try:
+                arr = self.step(step)[name]
+            except Exception:
+                if previous is None:
+                    self.ds.expressions.remove(name)
+                else:
+                    self.ds.expressions.define(name, previous, stored=self.ds.field_names)
+                raise
+            lo, hi = _finite_range(arr)
+            return {"ok": True, "name": name, "expr": self.ds.expressions[name], "min": lo, "max": hi, "calc": self.ds.expressions.to_list()}
+
+    def calc_remove(self, name: str) -> dict:
+        if self.ds is None:
+            raise RuntimeError("no dataset open")
+        with self.lock:
+            self.ds.undefine(name)
+            return {"ok": True, "calc": self.ds.expressions.to_list()}
+
+    def calc_check(self, expr: str, name: str | None = None) -> dict:
+        """Validate an expression (syntax, names, cycles) without evaluating it."""
+        if self.ds is None:
+            raise RuntimeError("no dataset open")
+        trial = self.ds.expressions.__class__(self.ds.expressions)
+        try:
+            trial.define(name or "_check_", expr, stored=self.ds.field_names)
+        except ExpressionError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
 
     # ------------------------------------------------------------ boundaries
     def _external(self):
@@ -235,10 +269,9 @@ class DataService:
         return out
 
 
-def _derived_descriptions(d: SEMData2D) -> dict:
-    from ..dataset import DERIVED_QUANTITIES
-
-    return {k: v for k, v in DERIVED_QUANTITIES.items() if k in d.available}
+def _finite_range(arr) -> tuple[float, float]:
+    finite = arr[np.isfinite(arr)]
+    return (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
 
 
 def browse(directory: str) -> dict:
@@ -302,6 +335,8 @@ def make_handler(service: DataService):
                     self.static(url.path)
             except FileNotFoundError as exc:
                 self._error(404, str(exc))
+            except ExpressionError as exc:
+                self._error(400, str(exc))
             except (KeyError, ValueError, IndexError, RuntimeError) as exc:
                 self._error(400, f"{type(exc).__name__}: {exc}")
             except BrokenPipeError:
@@ -325,11 +360,17 @@ def make_handler(service: DataService):
                         self._json({"error": f"{exc} exists", "exists": True}, 409)
                         return
                     self._json({"ok": True, "path": out})
+                elif url.path == "/api/calc/define":
+                    self._json(service.calc_define(str(body.get("name", "")), str(body.get("expr", "")), int(body.get("step", 0))))
+                elif url.path == "/api/calc/remove":
+                    self._json(service.calc_remove(str(body.get("name", ""))))
                 else:
                     raise FileNotFoundError(url.path)
             except FileNotFoundError as exc:
                 self._error(404, str(exc))
-            except (KeyError, ValueError, OSError) as exc:
+            except ExpressionError as exc:
+                self._error(400, str(exc))
+            except (KeyError, ValueError, OSError, RuntimeError) as exc:
                 self._error(400, f"{type(exc).__name__}: {exc}")
             except Exception as exc:  # noqa: BLE001
                 import traceback
@@ -367,6 +408,10 @@ def make_handler(service: DataService):
             elif route == "field":
                 data, meta = service.field(q["name"], int(q.get("step", 0)))
                 self._send(200, data, "application/octet-stream", {"X-Time": repr(meta["time"]), "X-Min": repr(meta["min"]), "X-Max": repr(meta["max"])})
+            elif route == "calc":
+                self._json({"calc": service.ds.expressions.to_list() if service.ds else []})
+            elif route == "calc/check":
+                self._json(service.calc_check(q.get("expr", ""), q.get("name") or None))
             elif route == "boundary/edges":
                 self._send(200, service.boundary_edges_bytes(int(q.get("m", 16))), "application/octet-stream")
             elif route == "boundary/detect":

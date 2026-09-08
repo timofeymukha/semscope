@@ -18,7 +18,7 @@ def data():
 
 def test_all_layers_render(tmp_path, data):
     pl = Plotter(figsize=(5, 5), dpi=60)
-    pl.add_field(data, "vorticity", cmap="RdBu_r", clim=(-4, 4))
+    pl.add_field(data, "dx(v) - dy(u)", cmap="RdBu_r", clim=(-4, 4))
     pl.add_contours(data, "p", levels=6, colors="k")
     pl.add_mesh(data)
     pl.add_nodes(data, size=1)
@@ -69,7 +69,7 @@ def test_cli_info_and_png(tmp_path, data, capsys):
     data.write(path)
     assert main(["--info", path]) == 0
     out = capsys.readouterr().out
-    assert "order N = 5" in out and "vorticity" in out
+    assert "order N = 5" in out and "['u', 'v', 'p']" in out
     png = str(tmp_path / "tg.png")
-    assert main(["--png", png, "--field", "vorticity", "--mesh", path]) == 0
+    assert main(["--png", png, "--field", "dx(v) - dy(u)", "--mesh", path]) == 0
     assert os.path.getsize(png) > 1000

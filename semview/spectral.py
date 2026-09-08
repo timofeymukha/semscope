@@ -179,8 +179,7 @@ def derivative_matrix(n: int) -> np.ndarray:
 def legendre_vandermonde(n: int) -> np.ndarray:
     """Vandermonde matrix ``V[i, k] = P_k(x_i)`` of the Legendre polynomials on the GLL nodes.
 
-    ``solve(V, f)`` gives the modal (Legendre) coefficients of nodal data — useful
-    for spectral-decay diagnostics.
+    ``solve(V, f)`` gives the modal (Legendre) coefficients of nodal data.
     """
     x = gll_nodes(n)
     V = np.zeros((n, n))

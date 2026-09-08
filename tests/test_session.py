@@ -16,7 +16,8 @@ def _session(path, **over):
     sess = {
         "semview_session": 1,
         "dataset": {"path": path, "step": 0},
-        "field": {"name": "vorticity", "cmap": "RdBu", "invert": True, "range": {"auto": False, "sym": True, "lo": -4.0, "hi": 4.0}},
+        "field": {"name": "vort", "cmap": "RdBu", "invert": True, "range": {"auto": False, "sym": True, "lo": -4.0, "hi": 4.0}},
+        "calc": {"defs": [{"name": "vort", "expr": "dx(v) - dy(u)"}], "open": True},
         "render": {"mode": 0, "edges": True, "contours": True, "nContours": 8, "nodes": False},
         "view": {"xlim": [-1.2, 1.2], "ylim": [-0.9, 0.9]},
         "probe": {"pinned": {"x": 1.0, "y": 0.0}, "snapAngle": False},
@@ -41,7 +42,7 @@ def test_save_load_roundtrip(tmp_path, dataset_file):
     assert out.endswith(".semview.json") and os.path.exists(out)
     back = load_session(out)
     assert back["dataset"]["path"] == dataset_file
-    assert back["field"]["name"] == "vorticity" and "saved" in back
+    assert back["field"]["name"] == "vort" and "saved" in back
     # relative dataset paths are resolved against the session file location
     rel = _session(os.path.basename(dataset_file))
     p2 = save_session(str(tmp_path / "rel.semview.json"), rel)
@@ -62,6 +63,7 @@ def test_plotter_from_session(tmp_path, dataset_file):
     pl, data = plotter_from_session(path, figsize=(4, 4), dpi=60)
     kinds = [L.kind for L in pl._layers]
     assert kinds == ["field", "contours", "mesh", "segments", "points"]
+    assert data.defined == ["vort"] and pl._layers[0].opts["name"] == "vort"
     assert pl._layers[0].opts["cmap"] == "RdBu_r" and pl._layers[0].opts["clim"] == (-4.0, 4.0)
     assert len(pl._layers[3].opts["segments"]) == 1  # hidden line is not drawn
     xl, yl = pl._limits()

@@ -146,6 +146,13 @@ async function api(route, params = {}) {
   return { buf, headers: res.headers };
 }
 
+async function post(route, body) {
+  const res = await fetch(`/api/${route}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(out.error || res.statusText);
+  return out;
+}
+
 async function loadState() {
   S.meta = await api('state');
   if (!S.meta.open) { $('file-info').textContent = 'No dataset loaded — use Open…'; openDialog(); return; }
@@ -177,7 +184,8 @@ function populateFields() {
   const sel = $('field');
   const prev = S.field;
   sel.innerHTML = '';
-  const groups = [['stored', S.meta.fields], ['derived', S.meta.available.filter(f => !S.meta.fields.includes(f))], ['resolution', S.meta.fields.map(f => `decay:${f}`)]];
+  const defs = calcDefs();
+  const groups = [['stored', S.meta.fields], ['calculator', defs.map(d => d.name).filter(n => !S.meta.fields.includes(n))]];
   for (const [label, names] of groups) {
     if (!names.length) continue;
     const og = document.createElement('optgroup');
@@ -185,13 +193,17 @@ function populateFields() {
     for (const nm of names) {
       const o = document.createElement('option');
       o.value = nm;
-      o.textContent = nm.startsWith('decay:') ? `log10 spectral decay of ${nm.slice(6)}` : (S.meta.derived[nm] ? `${nm}  (${S.meta.derived[nm]})` : nm);
+      const d = label === 'calculator' ? defs.find(c => c.name === nm) : null;
+      o.textContent = d ? `${nm} = ${d.expr}` : nm;
       og.appendChild(o);
     }
     sel.appendChild(og);
   }
+  S.meta.available = [...S.meta.fields, ...groups[1][1]];
   S.field = (prev && S.meta.available.includes(prev)) ? prev : S.meta.fields[0];
   sel.value = S.field;
+  renderCalcChips();
+  renderCalcList();
 }
 
 function setupTime() {
@@ -228,6 +240,7 @@ async function loadField() {
     requestRender();
     updateProbe();
     refreshLines();
+    if (CP.windowOpen) renderCalcList();
     if (S.playing) prefetch();
   } catch (err) { toast(err.message, true); }
 }
@@ -471,7 +484,7 @@ function clearHistory() { HIST.undo = []; HIST.redo = []; HIST.lastViewPush = 0;
 // (spectral evaluation along the segment) and drawn in the shared chart.
 const LINE_COLORS_DARK = ['#ffd166', '#5cc8ff', '#ff7eb6', '#4ade80', '#c084fc', '#fb923c', '#f87171', '#22d3ee'];
 const LINE_COLORS_LIGHT = ['#c2410c', '#1d4ed8', '#be185d', '#15803d', '#7e22ce', '#b45309', '#b91c1c', '#0e7490'];
-const LP = { layout: null, drag: null, panelDrag: null, xview: null, yview: null, hoverS: null, active: null, nextId: 1, hoverHit: null, showGrid: true, showElem: true, windowOpen: false };
+const LP = { layout: null, drag: null, xview: null, yview: null, hoverS: null, active: null, nextId: 1, hoverHit: null, showGrid: true, showElem: true, windowOpen: false };
 const SNAP_DEG = 10;
 
 const lineColor = L => (isLight() ? LINE_COLORS_LIGHT : LINE_COLORS_DARK)[L.colorIdx % LINE_COLORS_DARK.length];
@@ -578,12 +591,9 @@ function setLineWindow(open) {
   const p = $('line-panel');
   p.hidden = !LP.windowOpen;
   if (LP.windowOpen) {
-    if (!p.style.left) {   // first time: bottom-right corner of the view
-      const v = $('view').getBoundingClientRect();
-      p.style.left = Math.max(8, v.width - p.offsetWidth - 14) + 'px';
-      p.style.top = Math.max(8, v.height - p.offsetHeight - 14) + 'px';
-    }
-    clampPanel();
+    placePanel(p, 'br');
+    clampPanel(p);
+    p.style.zIndex = ++FLOAT.z;
     renderLegend();
     showLinePanel();
     drawLineChart();
@@ -595,11 +605,38 @@ function showLinePanel() {
   $('lp-title').textContent = S.lines.length ? `${S.field} along ${S.lines.length} line${S.lines.length === 1 ? '' : 's'}` + (n !== S.lines.length ? ` (${n} shown)` : '') : 'line chart — no lines yet (Shift-drag on the plot)';
 }
 
-function clampPanel() {
-  const p = $('line-panel'), v = $('view').getBoundingClientRect();
+// Tool windows float over the plot: dragged by their header, resized from the
+// corner (CSS resize), raised on click and kept inside the view.
+const FLOAT = { drag: null, z: 5 };
+function clampPanel(p = $('line-panel')) {
+  const v = $('view').getBoundingClientRect();
   const left = clamp(parseFloat(p.style.left) || 0, 0, Math.max(0, v.width - p.offsetWidth));
   const top = clamp(parseFloat(p.style.top) || 0, 0, Math.max(0, v.height - p.offsetHeight));
   p.style.left = left + 'px'; p.style.top = top + 'px';
+}
+/** First-time placement in a corner of the view: 'br' (bottom-right) or 'tl' (top-left, below the field title). */
+function placePanel(p, corner) {
+  if (p.style.left) return;
+  const v = $('view').getBoundingClientRect();
+  if (corner === 'tl') { p.style.left = '14px'; p.style.top = '56px'; }
+  else { p.style.left = Math.max(8, v.width - p.offsetWidth - 14) + 'px'; p.style.top = Math.max(8, v.height - p.offsetHeight - 14) + 'px'; }
+}
+function floatingPanel(p, head, onLayout) {
+  head.addEventListener('mousedown', ev => {
+    if (ev.target.closest('button, input')) return;
+    FLOAT.drag = { p, dx: ev.clientX - p.offsetLeft, dy: ev.clientY - p.offsetTop };
+    ev.preventDefault();
+  });
+  p.addEventListener('mousedown', () => { p.style.zIndex = ++FLOAT.z; });
+  new ResizeObserver(() => { if (!p.hidden) { clampPanel(p); if (onLayout) onLayout(); } }).observe(p);
+}
+const panelGeometry = p => ({ left: parseFloat(p.style.left) || null, top: parseFloat(p.style.top) || null, width: p.offsetWidth, height: p.offsetHeight });
+function applyPanelGeometry(p, g) {
+  if (!g) return;
+  if (g.width) p.style.width = g.width + 'px';
+  if (g.height) p.style.height = g.height + 'px';
+  if (g.left != null) p.style.left = g.left + 'px';
+  if (g.top != null) p.style.top = g.top + 'px';
 }
 
 /** Sidebar registry of the line probes: visibility, selection, editable end points. */
@@ -861,14 +898,177 @@ const resetChartZoom = () => { LP.xview = null; LP.yview = null; drawLineChart()
 lpc.addEventListener('dblclick', resetChartZoom);
 $('lp-reset').onclick = resetChartZoom;
 $('lp-close').onclick = () => setLineWindow(false);
-// move the panel by its header; resize with the grip in the corner (CSS resize)
-$('lp-head').addEventListener('mousedown', ev => {
-  if (ev.target.closest('button')) return;
-  const p = $('line-panel');
-  LP.panelDrag = { dx: ev.clientX - p.offsetLeft, dy: ev.clientY - p.offsetTop };
-  ev.preventDefault();
+floatingPanel($('line-panel'), $('lp-head'), drawLineChart);
+
+// ----------------------------------------------------------------- field calculator
+// New fields are defined on the server as expressions of the stored ones
+// (arithmetic, functions, dx()/dy() derivatives of any order).  They are
+// evaluated at the GLL nodes of every time step and then behave like stored
+// fields: they can be displayed, probed and sampled along lines.
+const CP = { windowOpen: false, checkTimer: null, checkToken: 0 };
+const calcDefs = () => (S.meta && S.meta.calc) || [];
+const isStored = nm => !!(S.meta && S.meta.fields && S.meta.fields.includes(nm));
+
+function setCalcWindow(open) {
+  CP.windowOpen = !!open;
+  const p = $('calc-panel');
+  p.hidden = !CP.windowOpen;
+  if (CP.windowOpen) {
+    placePanel(p, 'tl');
+    clampPanel(p);
+    p.style.zIndex = ++FLOAT.z;
+    renderCalcChips();
+    renderCalcList();
+    if (!$('cp-expr').value.trim()) setCalcStatus(calcIdle(), 'muted');
+    $('cp-expr').focus();
+  }
+}
+const calcIdle = () => (S.meta && S.meta.open) ? 'name = expression · Enter defines and shows the field · the chips insert at the caret' : 'open a dataset first';
+function setCalcStatus(text, cls = 'muted') { const el = $('cp-status'); el.textContent = text; el.className = 'cp-status mono ' + cls; }
+
+/** Insert into the expression at the caret; with a suffix the selection is wrapped, e.g. dx( … ). */
+function insertExpr(prefix, suffix = null) {
+  const inp = $('cp-expr');
+  const a = inp.selectionStart ?? inp.value.length, b = inp.selectionEnd ?? a;
+  const sel = inp.value.slice(a, b);
+  const ins = suffix === null ? prefix : prefix + sel + suffix;
+  const caret = suffix === null ? a + prefix.length : (sel ? a + ins.length : a + prefix.length);
+  inp.value = inp.value.slice(0, a) + ins + inp.value.slice(b);
+  inp.focus();
+  inp.setSelectionRange(caret, caret);
+  scheduleCheck();
+}
+
+function renderCalcChips() {
+  const box = $('cp-chips');
+  box.innerHTML = '';
+  if (!S.meta || !S.meta.open) return;
+  const sx = S.meta.calc_syntax || { functions: [], binary_functions: [], constants: [] };
+  const row = (label, chips) => {
+    const r = document.createElement('div'); r.className = 'cp-row';
+    const l = document.createElement('span'); l.className = 'cp-label'; l.textContent = label; r.appendChild(l);
+    for (const [text, action, title] of chips) {
+      const b = document.createElement('button'); b.type = 'button'; b.className = 'chip'; b.textContent = text; if (title) b.title = title;
+      b.onmousedown = ev => ev.preventDefault();   // keep focus and caret in the expression input
+      b.onclick = action;
+      r.appendChild(b);
+    }
+    box.appendChild(r);
+  };
+  const names = [...S.meta.fields, ...calcDefs().map(d => d.name).filter(n => !isStored(n)), 'x', 'y'];
+  row('fields', names.map(nm => [nm, () => insertExpr(nm), isStored(nm) ? 'stored field' : (nm === 'x' || nm === 'y' ? 'coordinate' : 'calculator field')]));
+  row('operators', ['+', '-', '*', '/', '^', '(', ')'].map(op => [op, () => insertExpr('()'.includes(op) ? op : ` ${op} `), op === '^' ? 'power (also **)' : null]));
+  row('derivatives', [
+    ['dx( )', () => insertExpr('dx(', ')'), 'd/dx of the selection (spectrally exact within each element)'],
+    ['dy( )', () => insertExpr('dy(', ')'), 'd/dy'],
+    ['dx( , 2)', () => insertExpr('dx(', ', 2)'), 'second derivative in x — dx(f, n) gives order n'],
+    ['dy( , 2)', () => insertExpr('dy(', ', 2)'), 'second derivative in y'],
+    ['dx(dy( ))', () => insertExpr('dx(dy(', '))'), 'mixed derivative by nesting'],
+  ]);
+  row('functions', [...sx.functions.map(fn => [fn, () => insertExpr(`${fn}(`, ')'), `${fn}(f)`]), ...sx.binary_functions.map(fn => [fn, () => insertExpr(`${fn}(`, ', )'), `${fn}(a, b)`]), ...sx.constants.map(c => [c, () => insertExpr(c), 'constant'])]);
+}
+
+function renderCalcList() {
+  const box = $('cp-list');
+  box.innerHTML = '';
+  const defs = calcDefs();
+  $('cp-count').textContent = defs.length ? `${defs.length} field${defs.length === 1 ? '' : 's'}` : '';
+  if (!defs.length) { const e = document.createElement('div'); e.className = 'cp-empty muted'; e.textContent = 'No calculator fields yet — e.g. vort = dx(v) - dy(u)'; box.appendChild(e); return; }
+  for (const d of defs) {
+    const item = document.createElement('div'); item.className = 'cp-item' + (S.field === d.name ? ' active' : '');
+    const show = () => { S.field = d.name; $('field').value = d.name; loadField(); renderCalcList(); };
+    const nm = document.createElement('span'); nm.className = 'name'; nm.textContent = d.name; nm.title = 'show this field'; nm.onclick = show;
+    const ex = document.createElement('span'); ex.className = 'expr mono'; ex.textContent = `= ${d.expr}`; ex.title = d.expr; ex.onclick = show;
+    const ed = document.createElement('button'); ed.className = 'edit'; ed.textContent = 'edit'; ed.title = 'load into the editor (Define replaces the definition)';
+    ed.onclick = () => { $('cp-name').value = d.name; $('cp-expr').value = d.expr; $('cp-expr').focus(); scheduleCheck(); };
+    const x = document.createElement('button'); x.className = 'x'; x.textContent = '✕'; x.title = 'remove this definition';
+    x.onclick = () => removeCalcField(d.name);
+    item.append(nm, ex, ed, x);
+    box.appendChild(item);
+  }
+}
+
+/** Live validation while typing (syntax, names, cycles); nothing is evaluated. */
+function scheduleCheck() {
+  clearTimeout(CP.checkTimer);
+  const expr = $('cp-expr').value.trim();
+  if (!expr) { setCalcStatus(calcIdle(), 'muted'); return; }
+  if (!S.meta || !S.meta.open) return;
+  CP.checkTimer = setTimeout(async () => {
+    const token = ++CP.checkToken;
+    try {
+      const r = await api('calc/check', { expr, name: $('cp-name').value.trim() });
+      if (token !== CP.checkToken) return;
+      setCalcStatus(r.ok ? '✓ valid — Enter defines it' : '✗ ' + r.error, r.ok ? 'ok' : 'err');
+    } catch (err) { if (token === CP.checkToken) setCalcStatus('✗ ' + err.message, 'err'); }
+  }, 250);
+}
+
+/** Cached values and line samples of calculator fields are dropped when a definition changes. */
+function invalidateCalc() {
+  for (const key of [...S.fieldCache.keys()]) if (!isStored(key.slice(key.indexOf(':') + 1))) S.fieldCache.delete(key);
+  for (const L of S.lines) if (L.field && !isStored(L.field)) L.data = null;
+}
+
+async function defineField() {
+  const name = $('cp-name').value.trim(), expr = $('cp-expr').value.trim();
+  if (!S.meta || !S.meta.open) { setCalcStatus('✗ open a dataset first', 'err'); return; }
+  if (!name) { setCalcStatus('✗ give the new field a name', 'err'); $('cp-name').focus(); return; }
+  if (!expr) { setCalcStatus('✗ enter an expression', 'err'); $('cp-expr').focus(); return; }
+  try {
+    const out = await post('calc/define', { name, expr, step: S.step });
+    S.meta.calc = out.calc;
+    invalidateCalc();
+    populateFields();
+    S.field = out.name; $('field').value = S.field;
+    setCalcStatus(`${out.name} = ${out.expr}   ∈ [${fmt(out.min, 5)}, ${fmt(out.max, 5)}] at step ${S.step}`, 'ok');
+    await loadField();
+    renderCalcList();
+  } catch (err) { setCalcStatus('✗ ' + err.message, 'err'); }
+}
+
+async function removeCalcField(name) {
+  try {
+    const out = await post('calc/remove', { name });
+    S.meta.calc = out.calc;
+    invalidateCalc();
+    populateFields();
+    setCalcStatus(`removed ${name}`, 'muted');
+    await loadField();
+    renderCalcList();
+  } catch (err) { setCalcStatus('✗ ' + err.message, 'err'); }
+}
+
+/** Make the server definitions match a list (sessions): define missing ones, drop extras. */
+async function syncCalcDefs(defs) {
+  const want = new Map((defs || []).map(d => [d.name, d.expr]));
+  let extra = calcDefs().filter(d => !want.has(d.name)).map(d => d.name);
+  for (let pass = 0; extra.length && pass < extra.length + 1; pass++) {   // dependents block removal: retry in passes
+    const left = [];
+    for (const nm of extra) { try { S.meta.calc = (await post('calc/remove', { name: nm })).calc; } catch { left.push(nm); } }
+    if (left.length === extra.length) break;
+    extra = left;
+  }
+  for (const [name, expr] of want) {
+    if (calcDefs().some(d => d.name === name && d.expr === expr)) continue;
+    try { S.meta.calc = (await post('calc/define', { name, expr, step: S.step })).calc; }
+    catch (err) { toast(`Calculator field ${name} not restored: ${err.message}`, true); }
+  }
+  invalidateCalc();
+  populateFields();
+  setCalcStatus(calcIdle(), 'muted');
+}
+
+$('cp-define').onclick = defineField;
+$('cp-close').onclick = () => setCalcWindow(false);
+$('btn-calc').onclick = () => setCalcWindow(!CP.windowOpen);
+$('cp-expr').addEventListener('input', scheduleCheck);
+$('cp-name').addEventListener('input', () => { if ($('cp-expr').value.trim()) scheduleCheck(); });
+for (const id of ['cp-name', 'cp-expr']) $(id).addEventListener('keydown', ev => {
+  if (ev.key === 'Enter') { ev.preventDefault(); defineField(); }
+  else if (ev.key === 'Escape') ev.target.blur();
 });
-new ResizeObserver(() => { if (!$('line-panel').hidden) { clampPanel(); drawLineChart(); } }).observe($('line-panel'));
+floatingPanel($('calc-panel'), $('cp-head'), null);
 
 // ----------------------------------------------------------------- mouse interaction
 overlay.style.pointerEvents = 'none';
@@ -921,10 +1121,10 @@ glCanvas.addEventListener('mousedown', ev => {
 });
 window.addEventListener('mousemove', ev => {
   if (LP.drag) { lpDrag(ev); return; }
-  if (LP.panelDrag) {
-    const p = $('line-panel');
-    p.style.left = (ev.clientX - LP.panelDrag.dx) + 'px'; p.style.top = (ev.clientY - LP.panelDrag.dy) + 'px';
-    clampPanel(); return;
+  if (FLOAT.drag) {
+    const { p, dx, dy } = FLOAT.drag;
+    p.style.left = (ev.clientX - dx) + 'px'; p.style.top = (ev.clientY - dy) + 'px';
+    clampPanel(p); return;
   }
   const rect = glCanvas.getBoundingClientRect();
   const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
@@ -984,7 +1184,7 @@ double-click: whole run up to the corners` : 'hover an external edge';
   }
 });
 window.addEventListener('mouseup', ev => {
-  LP.drag = null; LP.panelDrag = null;
+  LP.drag = null; FLOAT.drag = null;
   if (!S.drag || (S.drag.kind === 'line' && S.drag.fromMenu)) return;
   const d = S.drag; S.drag = null;
   if (d.kind === 'line') {
@@ -1464,15 +1664,17 @@ function pythonSnippet() {
   const [x0, y0] = screenToData(0, H()), [x1, y1] = screenToData(W(), 0);
   let cmap = S.cmap;
   if (S.invert) cmap = cmap.endsWith('_r') ? cmap.slice(0, -2) : cmap + '_r';
-  const field = S.field.startsWith('decay:') ? S.field.slice(6) : S.field;
+  const field = S.field;
   const lines = [
     'import semview',
     '',
     `data = semview.load(${JSON.stringify(S.meta.path)}, step=${S.step})`,
+  ];
+  for (const d of calcDefs()) lines.push(`data.define(${JSON.stringify(d.name)}, ${JSON.stringify(d.expr)})`);
+  lines.push(
     'pl = semview.Plotter(figsize=(9, 6))',
     `pl.add_field(data, ${JSON.stringify(field)}, cmap=${JSON.stringify(cmap)}, clim=(${fmt(S.range.lo, 6)}, ${fmt(S.range.hi, 6)})${S.mode === 1 ? ', method="nodal"' : ''})`,
-  ];
-  if (S.field.startsWith('decay:')) lines.push(`# GUI showed log10 of data.spectral_decay(${JSON.stringify(field)}) per element`);
+  );
   if (S.contours) lines.push(`pl.add_contours(data, ${JSON.stringify(field)}, levels=${S.nContours}, colors="w", linewidths=0.5)`);
   if (S.edges) lines.push('pl.add_mesh(data, color="k", linewidth=0.3)');
   if (S.nodes) lines.push('pl.add_nodes(data)');
@@ -1689,6 +1891,7 @@ window.addEventListener('keydown', ev => {
     case 'l': setLineMode(!S.lineMode); break;
     case 'w': setNormalMode(!NL.mode); break;
     case 'g': setLineWindow(!LP.windowOpen); break;
+    case 'k': setCalcWindow(!CP.windowOpen); break;
     case 'b': toggleSidebar(); break;
     case 'Escape':
       if (!ctxEl.hidden) { closeCtx(); break; }
@@ -1792,7 +1995,8 @@ function sessionState() {
     boundaries: BD.ext ? S.boundaries.map(b => ({ name: b.name, colorIdx: b.colorIdx, source: b.source, visible: b.visible, closed: !!b.closed, edges: b.edges.map(i => [BD.ext.ids[2 * i], BD.ext.ids[2 * i + 1]]) })) : [],
     boundaryAngle: BD.angle,
     showBoundaries: S.showBoundaries,
-    chart: { open: !p.hidden, left: parseFloat(p.style.left) || null, top: parseFloat(p.style.top) || null, width: p.offsetWidth, height: p.offsetHeight, grid: LP.showGrid, elem: LP.showElem, xview: LP.xview, yview: LP.yview },
+    chart: { open: !p.hidden, ...panelGeometry(p), grid: LP.showGrid, elem: LP.showElem, xview: LP.xview, yview: LP.yview },
+    calc: { defs: calcDefs().map(d => ({ name: d.name, expr: d.expr })), open: CP.windowOpen, ...panelGeometry($('calc-panel')) },
   };
 }
 
@@ -1819,7 +2023,12 @@ async function applySession(sess) {
   if (f.range) { S.range = { ...S.range, ...f.range }; setCheck('range-auto', S.range.auto); setCheck('range-sym', S.range.sym); }
   S.step = clamp(+(sess.dataset.step || 0), 0, S.meta.nsteps - 1);
   $('step-slider').value = S.step;
-  if (f.name && S.meta.available.includes(f.name) || (f.name || '').startsWith('decay:')) { S.field = f.name; setVal('field', f.name); }
+  // field-calculator definitions (before the field is chosen: it may be one of them)
+  const ca = sess.calc || {};
+  await syncCalcDefs(ca.defs || []);
+  applyPanelGeometry($('calc-panel'), ca);
+  setCalcWindow(ca.open === true);
+  if (f.name && S.meta.available.includes(f.name)) { S.field = f.name; setVal('field', f.name); }
   await loadField();
   if (f.range && !S.range.auto) setRange(f.range.lo, f.range.hi, false);
   // view: refit the stored extent to the current canvas
@@ -1838,11 +2047,7 @@ async function applySession(sess) {
   LP.showGrid = ch.grid !== false; setCheck('lp-grid', LP.showGrid);
   LP.showElem = ch.elem !== false; setCheck('lp-elem', LP.showElem);
   LP.xview = ch.xview || null; LP.yview = ch.yview || null;
-  const p = $('line-panel');
-  if (ch.width) p.style.width = ch.width + 'px';
-  if (ch.height) p.style.height = ch.height + 'px';
-  if (ch.left != null) p.style.left = ch.left + 'px';
-  if (ch.top != null) p.style.top = ch.top + 'px';
+  applyPanelGeometry($('line-panel'), ch);
   renderLegend();
   setLineWindow(ch.open === true || (ch.open === undefined && S.lines.length > 0));
   for (const L of S.lines) runLine(L);
@@ -1930,7 +2135,7 @@ function toggleSidebar() { $('app').classList.toggle('no-sidebar'); requestRende
 const SHORTCUTS = [
   ['wheel / drag', 'zoom / pan'], ['double-click', 'reset view'], ['right-click', 'context menu'],
   ['hover / click', 'probe / pin probe'], ['Shift-drag or l', 'line probe'], ['w', 'wall-normal line'],
-  ['Ctrl while dragging', 'snap line angle to 10°'], ['Del', 'delete selected line'], ['g', 'line chart window'],
+  ['Ctrl while dragging', 'snap line angle to 10°'], ['Del', 'delete selected line'], ['g', 'line chart window'], ['k', 'field calculator window'],
   ['b', 'sidebar'], ['Space, ← →, Home, End', 'time steps'], ['1 / 2', 'spectral / nodal rendering'],
   ['m, c, n', 'element edges, iso-lines, GLL nodes'], ['r', 'reset view'], ['s', 'screenshot'],
   ['o', 'open dataset or session'], ['Ctrl+S', 'save session'], ['Ctrl+Z / Ctrl+Shift+Z', 'undo / redo'], ['Esc', 'leave a mode / unpin probe'],
@@ -1959,6 +2164,7 @@ function menuItems(name) {
     { label: 'Reset view', key: 'r', disabled: !open, action: resetViewUser },
     '-',
     { label: 'Line chart window', key: 'g', checked: LP.windowOpen, action: () => setLineWindow(!LP.windowOpen) },
+    { label: 'Field calculator window', key: 'k', checked: CP.windowOpen, action: () => setCalcWindow(!CP.windowOpen) },
     { label: 'Sidebar', key: 'b', checked: !$('app').classList.contains('no-sidebar'), action: toggleSidebar },
     '-',
     { label: 'Axes', checked: S.axes, action: () => $('show-axes').click() },
@@ -2001,7 +2207,7 @@ function toast(msg, error = false) {
 }
 
 // ----------------------------------------------------------------- boot
-window.semview = { S, R, BD, NL, boundaryNodeAt, boundaryPointAt, edgePoint, createNormalLine, setNormalMode, api, requestRender, pythonSnippet, lineCSV, sessionState, applySession, detectBoundaries, setPickMode, toggleEdge, edgeAt };   // handy for debugging / scripting the GUI
+window.semview = { S, R, BD, NL, CP, setCalcWindow, defineField, removeCalcField, syncCalcDefs, boundaryNodeAt, boundaryPointAt, edgePoint, createNormalLine, setNormalMode, api, requestRender, pythonSnippet, lineCSV, sessionState, applySession, detectBoundaries, setPickMode, toggleEdge, edgeAt };   // handy for debugging / scripting the GUI
 (async () => {
   try {
     resize();

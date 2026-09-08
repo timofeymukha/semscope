@@ -6,8 +6,9 @@ Two ways to use it:
 
       import semview
       data = semview.load("case0.nek5000", step=-1)
+      data.define("vort", "dx(v) - dy(u)")        # field calculator, spectrally exact derivatives
       pl = semview.Plotter()
-      pl.add_field(data, "vorticity", cmap="RdBu_r", clim=(-5, 5))
+      pl.add_field(data, "vort", cmap="RdBu_r", clim=(-5, 5))
       pl.add_mesh(data)
       pl.save("vorticity.png")
 
@@ -23,7 +24,8 @@ import warnings as _warnings
 _os.environ.setdefault("PYSEMTOOLS_HIDE_LOG", "true")
 _warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array", category=DeprecationWarning)
 
-from .dataset import SEMData2D, Dataset, open, load, DERIVED_QUANTITIES  # noqa: F401,E402
+from .dataset import SEMData2D, Dataset, open, load  # noqa: F401,E402
+from .calc import ExpressionError  # noqa: F401,E402
 from .locate import ElementLocator  # noqa: F401,E402
 from .boundary import Boundary  # noqa: F401,E402
 from . import spectral  # noqa: F401,E402
@@ -44,4 +46,4 @@ def __getattr__(name):
     raise AttributeError(name)
 
 
-__all__ = ["SEMData2D", "Dataset", "open", "load", "Plotter", "serve", "spectral", "ElementLocator", "Boundary", "DERIVED_QUANTITIES"]
+__all__ = ["SEMData2D", "Dataset", "open", "load", "Plotter", "serve", "spectral", "ElementLocator", "Boundary", "ExpressionError"]

@@ -53,7 +53,6 @@ def main(argv=None) -> int:
             print(f"  bounds     : x in [{data.bounds[0]:g}, {data.bounds[1]:g}], y in [{data.bounds[2]:g}, {data.bounds[3]:g}]")
             print(f"  time(s)    : {ds.times}")
             print(f"  fields     : {data.field_names}")
-            print(f"  derived    : {[k for k in data.available if k not in data.field_names]}")
             for nm in data.field_names:
                 a = data[nm]
                 print(f"    {nm:10s} min {a.min(): .6g}  max {a.max(): .6g}")

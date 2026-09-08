@@ -4,8 +4,8 @@
 plain arrays ``(nelv, n, n)`` indexed ``[element, j, i]`` (``i`` along ``r``).
 It knows how to evaluate the spectral expansion anywhere (``sample``,
 ``sample_line``, ``to_grid``), how to oversample elements for rendering
-(``resample``) and how to form spectrally exact derived quantities such as
-vorticity.
+(``resample``) and how to evaluate calculator expressions on the nodal
+data (``evaluate``/``define``) with spectrally exact derivatives.
 
 :class:`Dataset` wraps a :class:`~semview.io.Nek5000Series` and loads steps on
 demand, reusing the mesh of the first file for mesh-less steps (the usual
@@ -20,18 +20,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import calc
 from . import spectral as sp
 from .locate import ElementLocator, Location
 
-__all__ = ["SEMData2D", "Dataset", "open", "load", "DERIVED_QUANTITIES"]
-
-
-DERIVED_QUANTITIES = {
-    "speed": "sqrt(u^2 + v^2)",
-    "vorticity": "dv/dx - du/dy",
-    "divergence": "du/dx + dv/dy",
-    "jacobian": "det(dx/dr) of the geometry map",
-}
+__all__ = ["SEMData2D", "Dataset", "open", "load"]
 
 
 @dataclass
@@ -47,6 +40,7 @@ class SEMData2D:
     source: str | None = None
     offset_el: int = 0
     glb_nelv: int | None = None
+    expressions: calc.Expressions | None = None   # calculator definitions, shared between steps
 
     def __post_init__(self):
         self.x = np.ascontiguousarray(self.x, dtype=float)
@@ -60,7 +54,12 @@ class SEMData2D:
             self.fields[k] = v
         if self.glb_nelv is None:
             self.glb_nelv = self.x.shape[0]
+        if self.expressions is None:
+            self.expressions = calc.Expressions()
+        elif not isinstance(self.expressions, calc.Expressions):
+            self.expressions = calc.Expressions(self.expressions)
         self._cache: dict = {}
+        self._calc_version = self.expressions.version
 
     # ------------------------------------------------------------ basic info
     @property
@@ -81,13 +80,14 @@ class SEMData2D:
         return list(self.fields.keys())
 
     @property
+    def defined(self) -> list[str]:
+        """Names defined with the field calculator (:meth:`define`)."""
+        return list(self.expressions)
+
+    @property
     def available(self) -> list[str]:
-        """Stored fields plus derived quantities that can be formed from them."""
-        names = list(self.fields)
-        if "u" in self.fields and "v" in self.fields:
-            names += ["speed", "vorticity", "divergence"]
-        names.append("jacobian")
-        return names
+        """Stored fields followed by the calculator definitions."""
+        return list(self.fields) + [k for k in self.expressions if k not in self.fields]
 
     @property
     def bounds(self) -> tuple[float, float, float, float]:
@@ -111,20 +111,31 @@ class SEMData2D:
 
     # ------------------------------------------------------------ fields
     def __getitem__(self, name: str) -> np.ndarray:
-        """Nodal values of a stored or derived field."""
+        """Nodal values of a stored field, a calculator definition, or an expression.
+
+        ``data["u"]`` returns the stored field, ``data["vort"]`` a field defined
+        with :meth:`define`, and ``data["dx(v) - dy(u)"]`` evaluates the
+        expression on the fly (see :mod:`semview.calc` for the syntax).
+        """
         if name in self.fields:
             return self.fields[name]
-        return self.derive(name)
+        if name in self.expressions:
+            return self._calc(name, self.expressions[name])
+        if calc.is_identifier(name):
+            if name in calc.COORDINATES:
+                return self.x if name == "x" else self.y
+            raise KeyError(f"unknown field {name!r}; available: {self.available}")
+        return self._calc(name, name)
 
     def __contains__(self, name: str) -> bool:
-        return name in self.available
+        return name in self.fields or name in self.expressions
 
     def add_field(self, name: str, values: np.ndarray) -> None:
         values = np.asarray(values)
         if values.shape != self.x.shape:
             raise ValueError(f"expected shape {self.x.shape}, got {values.shape}")
         self.fields[name] = values
-        self._cache.pop(("derived", name), None)
+        self._purge_calc()
 
     def metric(self) -> dict[str, np.ndarray]:
         """Geometric factors at the GLL nodes: ``xr, xs, yr, ys, jac, rx, ry, sx, sy``."""
@@ -138,36 +149,74 @@ class SEMData2D:
                 )
         return self._cache["metric"]
 
-    def gradient(self, name: str) -> tuple[np.ndarray, np.ndarray]:
-        """Spectrally exact physical gradient ``(df/dx, df/dy)`` of a field, element-wise."""
-        f = self[name]
+    def gradient(self, field) -> tuple[np.ndarray, np.ndarray]:
+        """Spectrally exact physical gradient ``(df/dx, df/dy)`` of a field (name, expression or array), element-wise."""
+        f = self[field] if isinstance(field, str) else np.asarray(field, dtype=float)
         fr, fs = sp.element_derivatives(f)
         m = self.metric()
         return fr * m["rx"] + fs * m["sx"], fr * m["ry"] + fs * m["sy"]
 
-    def derive(self, name: str) -> np.ndarray:
-        """Compute a derived quantity (see :data:`DERIVED_QUANTITIES`) or ``d<f>/dx``-style names."""
-        key = ("derived", name)
-        if key in self._cache:
-            return self._cache[key]
-        if name == "speed":
-            out = np.sqrt(self["u"] ** 2 + self["v"] ** 2)
-        elif name == "vorticity":
-            _, dudy = self.gradient("u")
-            dvdx, _ = self.gradient("v")
-            out = dvdx - dudy
-        elif name == "divergence":
-            dudx, _ = self.gradient("u")
-            _, dvdy = self.gradient("v")
-            out = dudx + dvdy
-        elif name == "jacobian":
-            out = self.metric()["jac"]
-        elif name.startswith("d") and name.endswith(("/dx", "/dy")) and "/" in name:
-            base = name[1:].rsplit("/", 1)[0]
-            out = self.gradient(base)[0 if name.endswith("/dx") else 1]
-        else:
-            raise KeyError(f"unknown field {name!r}; available: {self.available}")
-        self._cache[key] = out
+    def derivative(self, values, direction: int, order: int = 1) -> np.ndarray:
+        """``order``-th physical derivative along x (``direction=0``) or y (``direction=1``).
+
+        Applied repeatedly for higher orders; each application is the exact
+        derivative of the element polynomial, collocated back onto the GLL nodes.
+        """
+        arr = np.asarray(values, dtype=float)
+        if arr.shape != self.x.shape:   # a constant: its derivative vanishes
+            return np.zeros_like(self.x)
+        for _ in range(int(order)):
+            arr = self.gradient(arr)[direction]
+        return arr
+
+    # ------------------------------------------------------------ field calculator
+    def evaluate(self, expr: str) -> np.ndarray:
+        """Evaluate a calculator expression (see :mod:`semview.calc`) at the GLL nodes."""
+        return self._calc(expr, expr)
+
+    def define(self, name: str, expr: str) -> str:
+        """Define ``name`` as ``expr`` for this dataset (and every step sharing its definitions).
+
+        The expression is checked for syntax, unknown names and circular
+        references; evaluation happens lazily on first access and is cached.
+        """
+        name = self.expressions.define(name, expr, stored=self.fields)
+        self._purge_calc()
+        return name
+
+    def undefine(self, name: str) -> None:
+        """Remove a calculator definition (refused while other definitions use it)."""
+        self.expressions.remove(name)
+        self._purge_calc()
+
+    def _purge_calc(self):
+        for k in [k for k in self._cache if isinstance(k, tuple) and k[0] == "calc"]:
+            del self._cache[k]
+        self._calc_version = self.expressions.version
+
+    def _calc(self, key: str, expr: str, _stack: tuple = ()) -> np.ndarray:
+        if self._calc_version != self.expressions.version:
+            self._purge_calc()
+        ck = ("calc", key)
+        if ck in self._cache:
+            return self._cache[ck]
+
+        def resolve(nm):
+            if nm in self.fields:
+                return self.fields[nm]
+            if nm in calc.COORDINATES:
+                return self.x if nm == "x" else self.y
+            if nm in self.expressions:
+                if nm in _stack:
+                    raise calc.ExpressionError("circular definition: " + " -> ".join(_stack + (nm,)))
+                return self._calc(nm, self.expressions[nm], _stack + (nm,))
+            raise calc.ExpressionError(f"unknown field {nm!r}; available: {self.available + list(calc.COORDINATES)}")
+
+        out = calc.evaluate(expr, resolve, self.derivative)
+        out = np.asarray(out, dtype=float)
+        if out.shape != self.x.shape:
+            out = np.broadcast_to(out, self.x.shape).copy()
+        self._cache[ck] = out
         return out
 
     # ------------------------------------------------------------ geometry
@@ -301,20 +350,6 @@ class SEMData2D:
 
         return normal_line_at(self.x, self.y, int(elem), int(side), float(t), float(length))
 
-    def spectral_decay(self, name: str) -> np.ndarray:
-        """Per-element ratio of the energy in the highest Legendre mode to the total.
-
-        A cheap resolution indicator: values well below 1e-3 mean the element
-        resolves the field, values near 1 flag under-resolution.
-        """
-        f = self[name]
-        V = sp.legendre_vandermonde(self.n)
-        Vinv = np.linalg.inv(V)
-        modal = sp.tensor_apply(f, Vinv)  # (nelv, n, n) Legendre coefficients
-        total = np.sum(modal**2, axis=(1, 2)) + 1e-300
-        top = np.sum(modal[:, -1, :] ** 2, axis=1) + np.sum(modal[:, :, -1] ** 2, axis=1) - modal[:, -1, -1] ** 2
-        return top / total
-
     # ------------------------------------------------------------ MPI
     def gather(self, comm=None, root: int = 0) -> "SEMData2D | None":
         """Gather an element-distributed dataset to ``root`` (returns ``None`` elsewhere).
@@ -332,7 +367,7 @@ class SEMData2D:
         elmap = mpi.gatherv_elements(self.elmap, comm, root) if self.elmap is not None else None
         if comm.Get_rank() != root:
             return None
-        return SEMData2D(x, y, fields, time=self.time, elmap=elmap, name=self.name, source=self.source)
+        return SEMData2D(x, y, fields, time=self.time, elmap=elmap, name=self.name, source=self.source, expressions=self.expressions)
 
     # ------------------------------------------------------------ IO
     @classmethod
@@ -406,6 +441,7 @@ class Dataset:
         self._cache_bytes = cache_bytes
         self._mesh = None  # (x, y, elmap, offset_el, glb_nelv)
         self._mesh_file = mesh_file
+        self.expressions = calc.Expressions()   # calculator definitions, shared by all steps
         self._load_mesh()
 
     # ------------------------------------------------------------ properties
@@ -446,7 +482,7 @@ class Dataset:
                 # if this is also a step, cache its fields
                 try:
                     i = self.series.files.index(f)
-                    self._store(i, SEMData2D(coords[0], coords[1], fields, time=t, elmap=elmap, name=self.name, source=f, offset_el=offset, glb_nelv=glb))
+                    self._store(i, SEMData2D(coords[0], coords[1], fields, time=t, elmap=elmap, name=self.name, source=f, offset_el=offset, glb_nelv=glb, expressions=self.expressions))
                 except ValueError:
                     pass
                 return
@@ -458,7 +494,7 @@ class Dataset:
     def mesh(self) -> SEMData2D:
         """The mesh (as an empty-field :class:`SEMData2D`)."""
         x, y, elmap, offset, glb = self._mesh
-        return SEMData2D(x, y, {}, elmap=elmap, name=self.name, offset_el=offset, glb_nelv=glb)
+        return SEMData2D(x, y, {}, elmap=elmap, name=self.name, offset_el=offset, glb_nelv=glb, expressions=self.expressions)
 
     # ------------------------------------------------------------ steps
     def _store(self, i: int, data: SEMData2D):
@@ -484,7 +520,7 @@ class Dataset:
         if coords is not None:
             x, y = coords
             elmap = elmap_i
-        data = SEMData2D(x, y, fields, time=t, elmap=elmap, name=self.name, source=self.series.files[i], offset_el=offset, glb_nelv=glb)
+        data = SEMData2D(x, y, fields, time=t, elmap=elmap, name=self.name, source=self.series.files[i], offset_el=offset, glb_nelv=glb, expressions=self.expressions)
         self._store(i, data)
         return data
 
@@ -499,6 +535,14 @@ class Dataset:
     @property
     def field_names(self) -> list[str]:
         return self[0].field_names
+
+    # ------------------------------------------------------------ field calculator
+    def define(self, name: str, expr: str) -> str:
+        """Define a calculator field for every step of the series (see :meth:`SEMData2D.define`)."""
+        return self.expressions.define(name, expr, stored=self.field_names)
+
+    def undefine(self, name: str) -> None:
+        self.expressions.remove(name)
 
     def gather(self, i: int, root: int = 0) -> SEMData2D | None:
         """Load step ``i`` and gather it to ``root``."""

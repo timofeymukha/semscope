@@ -5,25 +5,23 @@ import semview
 from semview import synthetic
 
 
-def test_derived_quantities_taylor_green():
+def test_getitem_fields_and_expressions():
     k = np.pi
     data = synthetic.taylor_green(synthetic.wavy_box(8, 4, 10, amplitude=0.05), k=k)
-    x, y = data.x, data.y
-    vort = data["vorticity"]
-    exact = 2 * k * np.sin(k * x) * np.sin(k * y)
-    assert np.max(np.abs(vort - exact)) < 1e-4  # spectral accuracy at order 9
-    assert np.max(np.abs(data["divergence"])) < 1e-4
-    assert np.allclose(data["speed"], np.hypot(data["u"], data["v"]))
-    assert "vorticity" in data.available and "vorticity" in data
-    assert data["du/dx"].shape == x.shape
+    assert data.available == ["u", "v", "p"] and "u" in data
+    assert data["u"] is data.fields["u"]
+    assert np.allclose(data["x"], data.x)
+    dvdx, dvdy = data.gradient("v")
+    assert np.max(np.abs(dvdx - data["dx(v)"])) == 0 and np.max(np.abs(dvdy - data["dy(v)"])) == 0
+    assert np.max(np.abs(data.derivative(data["u"], 0, 1) - data["dx(u)"])) == 0
     with pytest.raises(KeyError):
         data["nope"]
 
 
-def test_jacobian_of_box_is_constant():
+def test_metric_of_box_is_constant():
     data = synthetic.box(3, 2, 5, xlim=(0, 3), ylim=(0, 1))
     # each element is 1 x 0.5 -> dx/dr = 0.5, dy/ds = 0.25
-    assert np.allclose(data["jacobian"], 0.125)
+    assert np.allclose(data.metric()["jac"], 0.125)
 
 
 def test_resample_and_vertices():
@@ -32,14 +30,6 @@ def test_resample_and_vertices():
     assert X.shape == (16, 5, 5)
     assert data.vertices.shape == (16, 4, 2)
     assert np.allclose(np.hypot(X, Y).min(), 0.5, atol=1e-12)
-
-
-def test_spectral_decay_indicator():
-    data = synthetic.box(2, 2, 8, xlim=(0, 1), ylim=(0, 1))
-    synthetic.add_analytic_field(data, "smooth", lambda x, y: x + y)
-    synthetic.add_analytic_field(data, "rough", lambda x, y: np.sin(40 * x * y))
-    assert data.spectral_decay("smooth").max() < 1e-20
-    assert data.spectral_decay("rough").max() > 1e-3
 
 
 def test_read_mixlay(mixlay):

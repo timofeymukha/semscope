@@ -20,7 +20,8 @@ os.makedirs(out, exist_ok=True)
 data = semview.load(path)
 print(data)
 
-# 1) full view: vorticity (derived, spectrally exact) with the element mesh
+# 1) full view: vorticity from the field calculator (spectrally exact derivatives) with the element mesh
+data.define("vorticity", "dx(v) - dy(u)")
 pl = semview.Plotter(figsize=(9, 6.3), dpi=130)
 pl.add_field(data, "vorticity", cmap="RdBu_r", clim=(-3, 3))
 pl.add_mesh(data, color="k", linewidth=0.25, alpha=0.5)
@@ -55,14 +56,4 @@ ax.set_title("velocity along y = 7 (grey lines: element boundaries)")
 ax.legend()
 fig.savefig(os.path.join(out, "demo_line.png"), bbox_inches="tight")
 
-# 4) resolution indicator: energy fraction in the highest Legendre mode
-decay = data.spectral_decay("u")
-import numpy as np  # noqa: E402
-
-indicator = semview.SEMData2D(data.x, data.y, {"log10 decay(u)": np.log10(np.maximum(decay, 1e-16))[:, None, None] * np.ones((1, data.n, data.n))})
-pl = semview.Plotter(figsize=(9, 6.3), dpi=130)
-pl.add_field(indicator, "log10 decay(u)", cmap="viridis", clim=(-8, 0))
-pl.add_mesh(data, color="k", linewidth=0.2, alpha=0.4)
-pl.set_title("per-element spectral decay of u (0 = under-resolved)")
-pl.save(os.path.join(out, "demo_resolution.png"))
 print("figures written to", out)

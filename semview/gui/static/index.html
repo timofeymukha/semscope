@@ -57,6 +57,9 @@
         <label for="cmap">colormap</label>
         <select id="cmap"></select>
       </div>
+      <div class="row" style="margin-top:8px">
+        <button id="btn-calc" class="btn small" title="Field calculator: define new fields as expressions of the stored ones — arithmetic, functions and dx()/dy() derivatives of any order (k)">ƒ  Field calculator…</button>
+      </div>
       <div class="row space" style="margin-top:8px">
         <label class="check"><input type="checkbox" id="range-auto" checked> auto range</label>
         <label class="check"><input type="checkbox" id="range-sym"> symmetric</label>
@@ -132,7 +135,7 @@
         <button id="btn-reset" class="btn" title="Reset view (Home / double-click)">Reset view</button>
         <button id="btn-shot" class="btn" title="Save a PNG of the current view (S)">Screenshot</button>
       </div>
-      <div class="keys muted">wheel: zoom · drag: pan · right-click: menu · Ctrl+Z / Ctrl+Shift+Z: undo / redo · Ctrl+S: save session · space: play · ←/→: step · m: edges · c: iso-lines · n: nodes · l: line probe · w: wall-normal line · Del: remove line · g: line chart window</div>
+      <div class="keys muted">wheel: zoom · drag: pan · right-click: menu · Ctrl+Z / Ctrl+Shift+Z: undo / redo · Ctrl+S: save session · space: play · ←/→: step · m: edges · c: iso-lines · n: nodes · l: line probe · w: wall-normal line · Del: remove line · g: line chart window · k: field calculator</div>
     </section>
   </aside>
 
@@ -141,7 +144,7 @@
     <canvas id="overlay"></canvas>
     <div id="status" class="mono"></div>
     <div id="toast" hidden></div>
-    <div id="line-panel" hidden>
+    <div id="line-panel" class="tool-panel" hidden>
       <div class="lp-head" id="lp-head">
         <span id="lp-title" class="mono grow" title="drag to move the panel"></span>
         <span id="lp-info" class="mono muted"></span>
@@ -156,6 +159,24 @@
         </span>
       </div>
       <div class="lp-body"><canvas id="lp-canvas" title="wheel: zoom distance · shift+wheel: zoom value · drag: pan · double-click: reset"></canvas></div>
+    </div>
+    <div id="calc-panel" class="tool-panel" hidden>
+      <div class="lp-head" id="cp-head">
+        <span id="cp-title" class="mono grow" title="drag to move the panel">field calculator</span>
+        <span id="cp-count" class="mono muted"></span>
+        <button id="cp-close" class="btn icon" title="Close (k) — the defined fields are kept">✕</button>
+      </div>
+      <div class="cp-body">
+        <div class="cp-form">
+          <input type="text" id="cp-name" class="mono" placeholder="name" spellcheck="false" autocomplete="off" title="Name of the new field: letters, digits and _ (redefine an existing calculator field by reusing its name)">
+          <span class="mono muted">=</span>
+          <input type="text" id="cp-expr" class="mono grow" placeholder="expression, e.g. dx(v) - dy(u)" spellcheck="false" autocomplete="off" title="Arithmetic (+ - * / ^), functions, dx(f) and dy(f) derivatives — dx(f, n) for order n, dx(dy(f)) for mixed ones">
+          <button id="cp-define" class="btn small primary" title="Define the field and show it (Enter)">Define</button>
+        </div>
+        <div id="cp-status" class="cp-status mono muted"></div>
+        <div id="cp-chips" class="cp-chips"></div>
+        <div id="cp-list" class="cp-list"></div>
+      </div>
     </div>
   </main>
 </div>
@@ -199,7 +220,7 @@
       <button id="sdlg-save" class="btn primary">Save</button>
       <button id="sdlg-download" class="btn" title="Download the session file through the browser instead of writing it on the server">Download</button>
     </div>
-    <div class="modal-foot muted">Stores the dataset and step, field, colormap and range, rendering options, view, pinned probe and line probes. Reopen it with <b>Open…</b>, with <b>semview file.semview.json</b>, or turn it into a figure with <b>semview --png out.png file.semview.json</b>.</div>
+    <div class="modal-foot muted">Stores the dataset and step, field, colormap and range, rendering options, view, pinned probe, line probes, boundaries and calculator fields. Reopen it with <b>Open…</b>, with <b>semview file.semview.json</b>, or turn it into a figure with <b>semview --png out.png file.semview.json</b>.</div>
   </div>
 </div>
 

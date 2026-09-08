@@ -2,7 +2,8 @@
 
 A session file (``*.semview.json``) records the dataset and time step, the
 field, colormap and range, the rendering options, the view extent, the
-pinned probe and the line probes.  The GUI saves and reloads them, and
+pinned probe, the line probes, the boundaries and the field-calculator
+definitions.  The GUI saves and reloads them, and
 :func:`plotter_from_session` turns one into a matplotlib
 :class:`~semview.plotting.Plotter`, so a view composed interactively can be
 reproduced as a publication figure.
@@ -69,14 +70,10 @@ def plotter_from_session(session, figsize=(9, 6), dpi=150, comm=None):
     data = ds[int(sess["dataset"].get("step", 0))].gather(ds.comm)
     if data is None:
         return None, None
+    for d in (sess.get("calc") or {}).get("defs", []):   # field-calculator definitions, in order
+        data.define(d["name"], d["expr"])
     fld = sess.get("field", {})
     name = fld.get("name", data.field_names[0])
-    if name.startswith("decay:"):
-        import numpy as np
-
-        base = name[6:]
-        dec = np.log10(np.maximum(data.spectral_decay(base), 1e-16))[:, None, None] * np.ones((1, data.n, data.n))
-        data.add_field(name, dec)
     cmap = fld.get("cmap", "viridis")
     if fld.get("invert"):
         cmap = cmap[:-2] if cmap.endswith("_r") else cmap + "_r"

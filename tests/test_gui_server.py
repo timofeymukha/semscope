@@ -45,7 +45,7 @@ def test_state_and_static(server):
     st = json.loads(body)
     assert st["open"] and st["nelv"] == 24 and st["n"] == 6
     assert st["fields"] == ["u", "v", "p"]
-    assert "vorticity" in st["available"]
+    assert st["available"] == ["u", "v", "p"] and st["calc"] == [] and "sqrt" in st["calc_syntax"]["functions"]
     assert len(st["gll"]) == 6 and abs(st["gll"][0] + 1) < 1e-15
     html, hdr = get(base + "/")
     assert b"<title>semview</title>" in html
@@ -66,11 +66,6 @@ def test_mesh_and_field_binary(server):
     u = np.frombuffer(body, dtype="<f4")
     assert np.allclose(u, d["u"].ravel(), atol=1e-6)
     assert abs(float(hdr["X-Min"]) - d["u"].min()) < 1e-12
-    body, hdr = get(base + "/api/field?name=vorticity&step=0")
-    assert len(body) == n * 4
-    body, hdr = get(base + "/api/field?name=decay:u&step=0")
-    dec = np.frombuffer(body, dtype="<f4").reshape(24, 6, 6)
-    assert np.allclose(dec, dec[:, :1, :1])  # per-element constant
     body, _ = get(base + "/api/elmap")
     assert np.frombuffer(body, dtype="<i4")[0] == 1
 
@@ -130,3 +125,59 @@ def test_boundary_endpoints(server):
     assert len(det["groups"]) == 2 and all(g["closed"] for g in det["groups"])
     assert sorted(len(g["edges"]) for g in det["groups"]) == [12, 12]
     assert all(0 <= i < nb for g in det["groups"] for i in g["edges"])
+
+
+def post(url, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def test_field_calculator_endpoints(server):
+    base, service = server
+    d = service.get_step(0)
+    # live validation does not define anything
+    assert json.loads(get(base + "/api/calc/check?expr=dx(v)+-+dy(u)")[0]) == {"ok": True}
+    chk = json.loads(get(base + "/api/calc/check?expr=dx(q)")[0])
+    assert not chk["ok"] and "q" in chk["error"]
+    assert not json.loads(get(base + "/api/calc/check?expr=u&name=u")[0])["ok"]
+    assert json.loads(get(base + "/api/state")[0])["calc"] == []
+    # define, use everywhere a field name is accepted, redefine, remove
+    status, out = post(base + "/api/calc/define", {"name": "vort", "expr": "dx(v) - dy(u)", "step": 0})
+    assert status == 200 and out["ok"] and out["calc"] == [{"name": "vort", "expr": "dx(v) - dy(u)"}]
+    assert out["max"] > 0 > out["min"]
+    st = json.loads(get(base + "/api/state")[0])
+    assert st["available"] == ["u", "v", "p", "vort"] and st["calc"] == out["calc"]
+    body, hdr = get(base + "/api/field?name=vort&step=0")
+    w = np.frombuffer(body, dtype="<f4")
+    assert np.allclose(w, d["dx(v) - dy(u)"].ravel(), atol=1e-5)
+    pr = json.loads(get(base + "/api/probe?x=1.0&y=0.0&step=0&fields=vort,u")[0])
+    assert pr["found"] and abs(pr["values"]["vort"] - 4 * np.sin(2.0) * np.sin(0.0)) < 1e-3  # order 5 on curved elements
+    ln = json.loads(get(base + "/api/line?x0=0.6&y0=0&x1=1.4&y1=0&step=0&fields=vort&n=5")[0])
+    assert len(ln["values"]["vort"]) == 5
+    status, out = post(base + "/api/calc/define", {"name": "ke", "expr": "0.5 * (u^2 + v^2) + 0 * vort"})
+    assert status == 200 and [c["name"] for c in out["calc"]] == ["vort", "ke"]
+    status, out = post(base + "/api/calc/remove", {"name": "vort"})
+    assert status == 400 and "used by" in out["error"]
+    status, out = post(base + "/api/calc/define", {"name": "vort", "expr": "dx(v) - dy(u) +"})
+    assert status == 400 and "syntax" in out["error"]
+    assert json.loads(get(base + "/api/calc")[0])["calc"][0]["expr"] == "dx(v) - dy(u)"  # failed redefinition keeps the old one
+    status, out = post(base + "/api/calc/define", {"name": "u", "expr": "v"})
+    assert status == 400 and "field of the file" in out["error"]
+    status, out = post(base + "/api/calc/remove", {"name": "ke"})
+    assert status == 200 and out["calc"] == [{"name": "vort", "expr": "dx(v) - dy(u)"}]
+    status, out = post(base + "/api/calc/remove", {"name": "vort"})
+    assert status == 200 and out["calc"] == []
+    status, out = get_status(base + "/api/field?name=vort&step=0")
+    assert status == 400
+
+
+def get_status(url):
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()

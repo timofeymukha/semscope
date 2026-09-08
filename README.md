@@ -14,9 +14,9 @@ the way the solver does:
 * **the field is a polynomial on every element**, so it can be evaluated at
   *any* point, not only at the GLL nodes.  When you zoom in, semview
   oversamples the basis instead of showing linear facets;
-* **spectrally exact derivatives** (vorticity, divergence, gradients) and
-  **exact point/line probes** by inverting the polynomial geometry map;
-* **resolution diagnostics** from the decay of the Legendre spectrum.
+* **a field calculator** with spectrally exact derivatives of any order
+  (`dx(v) - dy(u)`, `dx(u, 2) + dy(u, 2)`, `dx(dy(p))`) and **exact point/line
+  probes** by inverting the polynomial geometry map.
 
 Two ways to use it:
 
@@ -41,8 +41,9 @@ ds = semview.open("mixlay0.nek5000")          # .nek5000 metafile, a case0.f0001
 print(ds)                                     # Dataset('mixlay', steps=1, nelv=1600, order=7)
 data = ds[-1]                                 # SEMData2D for the last step (mesh shared between steps)
 
+data.define("vort", "dx(v) - dy(u)")          # field calculator: spectrally exact derivatives
 pl = semview.Plotter(figsize=(9, 6))
-pl.add_field(data, "vorticity", cmap="RdBu_r", clim=(-3, 3))   # derived on the fly, spectrally exact
+pl.add_field(data, "vort", cmap="RdBu_r", clim=(-3, 3))
 pl.add_contours(data, "p", levels=15, colors="w", linewidths=0.5)
 pl.add_mesh(data, color="k", linewidth=0.3)                     # true curved element edges
 pl.set_view((8, 12), (5, 9))                                    # zoom: oversampling adapts to the pixel size
@@ -88,16 +89,34 @@ Sides are numbered counter-clockwise: 0 bottom (`s=-1`), 1 right (`r=+1`),
 ```python
 data.fields            # {'u': (nelv, n, n), 'v': ..., 'p': ...}  indexed [element, j, i]
 data.x, data.y         # GLL node coordinates, same shape
-data["vorticity"]      # derived quantities: speed, vorticity, divergence, jacobian, "du/dx", ...
+data["dx(v) - dy(u)"]  # any calculator expression evaluates at the GLL nodes
+data.define("ke", "0.5 * (u^2 + v^2)")   # named definition; data["ke"] and the Plotter accept it
 data.gradient("p")     # (dp/dx, dp/dy) at the GLL nodes
 X, Y, U = data.resample("u", 16)             # oversample every element on a 16 x 16 grid
 u = data.sample("u", x, y)                   # exact values at arbitrary points (NaN outside)
 dist, vals = data.sample_line(["u", "v"], (0, 7), (20, 7), 500)
 xg, yg, grid = data.to_grid("u", nx=800)     # Cartesian resampling (e.g. for FFTs / exports)
 loc = data.locate(x, y)                      # element index and (r, s) of points
-data.spectral_decay("u")                     # per-element under-resolution indicator
 data.write("out0.f00000")                    # back to a Nek5000 file through pysemtools
 ```
+
+### Field calculator
+
+New fields are expressions of the stored ones, evaluated at the GLL nodes:
+
+* arithmetic `+ - * / ^` (or `**`), parentheses, numbers, `pi`, `e`, the
+  coordinates `x` and `y`;
+* functions `sqrt exp log log10 abs sign sin cos tan asin acos atan sinh cosh
+  tanh` and `atan2 min max pow`;
+* derivatives `dx(f)`, `dy(f)`, higher orders `dx(f, 3)`, mixed ones by
+  nesting `dx(dy(f))`.  Each derivative is the exact derivative of the
+  element polynomial, collocated back onto the GLL nodes (so it can jump
+  between elements, as CG data does).
+
+`data.define(name, expr)` registers a name for the current step, and
+`Dataset.define` for a whole series; definitions may use earlier definitions
+(cycles are refused).  Nothing is derived automatically: the field list holds
+what the file contains plus what you define.
 
 ### MPI
 
@@ -119,7 +138,7 @@ semview case0.nek5000            # opens http://127.0.0.1:8765 in your browser
 semview                          # start empty and use the Open… dialog
 mpirun -n 4 semview big0.nek5000 # parallel reads; rank 0 serves the browser
 semview --info case0.nek5000     # print what is in the file
-semview --png out.png --field vorticity --cmap RdBu_r --mesh case0.nek5000
+semview --png out.png --field "dx(v) - dy(u)" --cmap RdBu_r --mesh case0.nek5000
 ```
 
 What the GUI does differently from a generic viewer:
@@ -153,8 +172,13 @@ What the GUI does differently from a generic viewer:
   the chart is the wall (negative lengths go outward). Such lines stay attached
   to their wall: dragging the origin slides it along the connected boundary run
   it belongs to, dragging the far end only changes the length;
-* derived quantities (vorticity, divergence, speed) and the **spectral-decay
-  resolution indicator** per element;
+* a **field calculator** window (`k`, or *View → Field calculator*): type
+  `name = expression` — arithmetic, functions and `dx()`/`dy()` derivatives of
+  any order — and the new field appears in the variable list, can be probed and
+  sampled along lines, follows the time step, and is saved in sessions. The
+  input is validated while typing, chips insert fields, operators and functions
+  at the caret, and definitions can be edited or removed (removal is refused
+  while another definition uses the field);
 * **boundaries**: *Detect* finds the external element edges and splits them
   into boundaries at corners sharper than the feature angle (default 90°);
   *New manual…* lets you click external edges on the plot to build a boundary

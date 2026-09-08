@@ -13,8 +13,9 @@ data = synthetic.taylor_green(synthetic.annulus(nr=4, ntheta=32, n=8, r_in=0.5, 
 synthetic.add_analytic_field(data, "s0", lambda x, y: np.tanh(4 * (np.hypot(x, y) - 1.0)) * np.cos(6 * np.arctan2(y, x)))
 
 print(data)
-print("max |divergence| (spectral accuracy: small, decays exponentially with order):", np.abs(data["divergence"]).max())
-print("vorticity error vs analytic:", np.abs(data["vorticity"] - 2 * 2.5 * np.sin(2.5 * data.x) * np.sin(2.5 * data.y)).max())
+print("max |div u| (spectral accuracy: small, decays exponentially with order):", np.abs(data["dx(u) + dy(v)"]).max())
+data.define("vort", "dx(v) - dy(u)")
+print("vorticity error vs analytic:", np.abs(data["vort"] - 2 * 2.5 * np.sin(2.5 * data.x) * np.sin(2.5 * data.y)).max())
 
 pl = semview.Plotter(figsize=(7, 7))
 pl.add_field(data, "s0", cmap="twilight")
