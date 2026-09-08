@@ -289,7 +289,8 @@ def compute_forces(
         "p": pick(pe), "cp": (pick(pe) - float(p_ref)) / q,
         "tau": pick(tau), "cf": pick(tau) / q,
         "chain": np.concatenate(chain_id).astype(int),
-        "edge": ie.astype(int),
+        "edge": ie.astype(int),          # index into ``edges`` of the edge each point lies on
+        "elem": el[ie].astype(int),      # local element index of that edge
     }
     return Forces(
         name=name, edges=edges, length=length,

@@ -30,7 +30,7 @@ html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text);
 #sidebar { grid-column: 1; grid-row: 2; background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; }
 #brand { padding: 16px 18px 10px; border-bottom: 1px solid var(--border); }
 .logo { font-weight: 700; font-size: 18px; letter-spacing: 0.3px; display: flex; align-items: center; gap: 9px; }
-.logo-mark { width: 16px; height: 16px; border-radius: 4px; background: conic-gradient(from 45deg, var(--accent), var(--accent-2), #ff7eb6, var(--accent)); box-shadow: 0 0 14px rgba(92,200,255,.35); }
+.logo-mark { width: 24px; height: 24px; display: block; filter: drop-shadow(0 0 7px rgba(92,200,255,.45)); }
 .tagline { color: var(--muted); font-size: 11px; margin-top: 2px; }
 .panel { padding: 12px 18px; border-bottom: 1px solid var(--border); }
 .panel h2 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; align-items: baseline; }

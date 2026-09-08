@@ -198,7 +198,7 @@ What the GUI does differently from a generic viewer:
   `U`, `L`, `p_ref` and the projection axes (default x and y, or rotated by an
   angle), and read the pressure, viscous and total forces with their
   coefficients per boundary and summed; `Cp` or `Cf` along each wall are
-  plotted against arc length, hovering marks the point on the plot, the chart
+  plotted against arc length with the element boundaries marked, hovering marks the point on the plot, the chart
   zooms and pans like the line chart (wheel: arc length, `Shift`+wheel: value,
   drag, double-click to reset), and the table and distributions can be copied
   or downloaded. Results follow the time
@@ -222,6 +222,8 @@ What the GUI does differently from a generic viewer:
   export line samples as CSV, and **copy a Python snippet** that reproduces the
   current view with the scripting API (field, colormap, range, layers, view
   limits, probes);
+* *Range to view* (`v`) sets the colormap limits from the field values inside
+  the visible part of the domain, so a zoomed region uses the full colour scale;
 * time series from the `.nek5000` metafile with playback and prefetching;
 * colormaps come from matplotlib, so figures and GUI look the same.
 

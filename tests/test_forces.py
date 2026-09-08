@@ -58,6 +58,8 @@ def test_pressure_force_on_cylinder():
     dist = F.distribution
     assert np.all(np.diff(dist["s"]) >= -1e-12) and abs(dist["s"][-1] - np.pi) < 1e-3
     assert np.allclose(dist["cp"], dist["x"] / 0.5, atol=1e-10)
+    assert len(dist["edge"]) == len(dist["elem"]) == len(dist["s"]) and set(dist["elem"]) == set(inner.edges[:, 0])
+    assert np.count_nonzero(np.diff(dist["edge"])) == len(inner) - 1   # one crossing per element boundary
     assert np.allclose(np.hypot(dist["x"], dist["y"]), 0.5, atol=1e-9)
 
 

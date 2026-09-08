@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>semscope</title>
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -18,7 +19,7 @@
   </header>
   <aside id="sidebar">
     <header id="brand">
-      <div class="logo"><span class="logo-mark"></span>semscope</div>
+      <div class="logo"><img class="logo-mark" src="/icon.svg" alt="">semscope</div>
       <div class="tagline">spectral-element viewer</div>
     </header>
 
@@ -59,6 +60,7 @@
       </div>
       <div class="row" style="margin-top:8px">
         <button id="btn-calc" class="btn small" title="Field calculator: define new fields as expressions of the stored ones — arithmetic, functions and dx()/dy() derivatives of any order (k)">ƒ  Field calculator…</button>
+        <button id="btn-fit-range" class="btn small" title="Set min / max to the range of the field over the GLL nodes inside the current view and switch auto range off (v)">Range to view</button>
       </div>
       <div class="row space" style="margin-top:8px">
         <label class="check"><input type="checkbox" id="range-auto" checked> auto range</label>
@@ -136,7 +138,7 @@
         <button id="btn-reset" class="btn" title="Reset view (Home / double-click)">Reset view</button>
         <button id="btn-shot" class="btn" title="Save a PNG of the current view (S)">Screenshot</button>
       </div>
-      <div class="keys muted">wheel: zoom · drag: pan · right-click: menu · Ctrl+Z / Ctrl+Shift+Z: undo / redo · Ctrl+S: save session · space: play · ←/→: step · m: edges · c: iso-lines · n: nodes · l: line probe · w: wall-normal line · Del: remove line · g: line chart window · k: field calculator · f: forces</div>
+      <div class="keys muted">wheel: zoom · drag: pan · right-click: menu · Ctrl+Z / Ctrl+Shift+Z: undo / redo · Ctrl+S: save session · space: play · ←/→: step · m: edges · c: iso-lines · n: nodes · l: line probe · w: wall-normal line · Del: remove line · g: line chart window · k: field calculator · f: forces · v: colormap range to view</div>
     </section>
   </aside>
 
@@ -219,6 +221,7 @@
           <select id="fp-plot" class="fp-sel" title="quantity plotted against the arc length of each selected boundary">
             <option value="cp">Cp = (p − p_ref) / q</option><option value="cf">Cf = τw / q</option><option value="p">p</option><option value="tau">τw</option>
           </select>
+          <label class="check" title="Mark where the wall passes from one element to the next (full lines when they are sparse enough, ticks on the axis when dense)"><input type="checkbox" id="fp-elem" checked> element bounds</label>
           <span id="fp-hover" class="mono muted grow"></span>
         </div>
         <div class="fp-chart"><canvas id="fp-canvas" title="hover: values and position on the plot · wheel: zoom arc length · shift+wheel: zoom value · drag: pan · double-click: reset · right-click: export"></canvas></div>

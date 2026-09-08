@@ -253,6 +253,27 @@ function prefetch() {
   }
 }
 
+/** Colormap range from the field values at the GLL nodes inside the current view (switches auto range off). */
+function fitRangeToView() {
+  if (!S.current || !S.mesh) { toast('No field loaded', true); return; }
+  const [x0, y0] = screenToData(0, H()), [x1, y1] = screenToData(W(), 0);
+  const { x, y } = S.mesh, v = S.current.values;
+  let lo = Infinity, hi = -Infinity, cnt = 0;
+  for (let i = 0; i < v.length; i++) {
+    const xi = x[i], yi = y[i];
+    if (xi < x0 || xi > x1 || yi < y0 || yi > y1) continue;
+    const f = v[i];
+    if (f !== f || f === Infinity || f === -Infinity) continue;
+    if (f < lo) lo = f;
+    if (f > hi) hi = f;
+    cnt++;
+  }
+  if (!cnt) { toast('No GLL nodes inside the view', true); return; }
+  S.range.auto = false; $('range-auto').checked = false;
+  setRange(lo, hi, false);
+  toast(`Colormap range fitted to ${cnt.toLocaleString()} nodes in view: [${fmt(lo, 5)}, ${fmt(hi, 5)}]`);
+}
+
 function setRange(lo, hi, fromUser) {
   if (S.range.sym) { const a = Math.max(Math.abs(lo), Math.abs(hi)); lo = -a; hi = a; }
   if (lo === hi) { lo -= 0.5; hi += 0.5; }
@@ -1086,7 +1107,7 @@ floatingPanel($('calc-panel'), $('cp-head'), null);
 // on the body per unit depth) with the GLL quadrature of the boundary edges.
 // The window shows pressure / viscous / total parts along configurable axes,
 // the force coefficients, and Cp or Cf along the wall.
-const FC = { windowOpen: false, sel: new Set(), result: null, token: 0, timer: null, hover: null, sig: '', plot: 'cp', layout: null, xview: null, yview: null, drag: null };
+const FC = { windowOpen: false, sel: new Set(), result: null, token: 0, timer: null, hover: null, sig: '', plot: 'cp', layout: null, xview: null, yview: null, drag: null, showElem: true };
 const FORCE_SELECTS = ['fp-u', 'fp-v', 'fp-w', 'fp-p', 'fp-rho-mode', 'fp-mu-mode'];
 
 function setForceWindow(open) {
@@ -1279,8 +1300,21 @@ function drawForceChart() {
   ctx.strokeStyle = dim; ctx.strokeRect(pad.l + 0.5, pad.t + 0.5, pw, ph);
   ctx.fillStyle = dim; ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'; ctx.fillText((FC.xview || FC.yview) ? 'arc length s  (zoomed — double-click to reset)' : 'arc length s', pad.l + pw, pad.t + ph - 3);
   ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillText(FP_LABELS[key], pad.l + 4, pad.t + 3);
-  // curves (one polyline per chain of connected edges)
   ctx.save(); ctx.beginPath(); ctx.rect(pad.l, pad.t, pw, ph); ctx.clip();
+  // element boundaries along the wall: full lines when sparse, ticks on the axis when dense
+  if (FC.showElem) {
+    for (const q of series) {
+      const e = q.res.dist.edge, marks = [];
+      for (let i = 1; i < q.s.length; i++) if (e[i] !== e[i - 1] && q.s[i] >= s0 && q.s[i] <= s1) marks.push(q.s[i]);
+      const dense = marks.length > pw / 8;
+      ctx.strokeStyle = q.color; ctx.globalAlpha = dense ? 0.6 : 0.3; ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (const s of marks) { const px = Math.round(X(s)) + 0.5; ctx.moveTo(px, dense ? pad.t + ph - 6 : pad.t); ctx.lineTo(px, pad.t + ph); }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+  // curves (one polyline per chain of connected edges)
   for (const q of series) {
     ctx.strokeStyle = q.color; ctx.lineWidth = 1.4; ctx.beginPath();
     let prev = -1;
@@ -1316,7 +1350,8 @@ fpc.addEventListener('mousemove', ev => {
   if (!best) return;
   const { q, i } = best, d = q.res.dist;
   FC.hover = { key: FC.plot, x: d.x[i], y: d.y[i], nx: d.nx[i], ny: d.ny[i], s: d.s[i], v: q.v[i], color: q.color };
-  $('fp-hover').textContent = `${q.res.name}: s = ${fmt(d.s[i], 5)}   (${fmt(d.x[i], 5)}, ${fmt(d.y[i], 5)})   Cp ${fmt(d.cp[i], 4)}   Cf ${fmt(d.cf[i], 4)}   p ${fmt(d.p[i], 4)}   τw ${fmt(d.tau[i], 4)}`;
+  const gid = d.elem && S.mesh ? S.mesh.elmap[d.elem[i]] : null;
+  $('fp-hover').textContent = `${q.res.name}: s = ${fmt(d.s[i], 5)}   (${fmt(d.x[i], 5)}, ${fmt(d.y[i], 5)})${gid !== null ? `   element ${gid}` : ''}   Cp ${fmt(d.cp[i], 4)}   Cf ${fmt(d.cf[i], 4)}   p ${fmt(d.p[i], 4)}   τw ${fmt(d.tau[i], 4)}`;
   drawForceChart(); requestRender();
 });
 fpc.addEventListener('mouseleave', () => { if (FC.drag) return; FC.hover = null; $('fp-hover').textContent = ''; drawForceChart(); requestRender(); });
@@ -1375,8 +1410,8 @@ function forceTableText() {
 /** CSV of the wall distributions of every computed boundary. */
 function forceCSV() {
   const R = FC.result; if (!R) return '';
-  const rows = ['boundary,s,x,y,nx,ny,p,cp,tau_w,cf'];
-  for (const res of R.boundaries) { const d = res.dist; for (let i = 0; i < d.s.length; i++) rows.push(`${res.name},${d.s[i]},${d.x[i]},${d.y[i]},${d.nx[i]},${d.ny[i]},${d.p[i]},${d.cp[i]},${d.tau[i]},${d.cf[i]}`); }
+  const rows = ['boundary,s,x,y,element,nx,ny,p,cp,tau_w,cf'];
+  for (const res of R.boundaries) { const d = res.dist; for (let i = 0; i < d.s.length; i++) rows.push(`${res.name},${d.s[i]},${d.x[i]},${d.y[i]},${d.elem && S.mesh ? S.mesh.elmap[d.elem[i]] : ''},${d.nx[i]},${d.ny[i]},${d.p[i]},${d.cp[i]},${d.tau[i]},${d.cf[i]}`); }
   return rows.join('\n') + '\n';
 }
 
@@ -1384,6 +1419,7 @@ $('fp-close').onclick = () => setForceWindow(false);
 $('fp-copy').onclick = () => { if (FC.result) copyText(forceTableText(), 'Force table copied'); else toast('Nothing computed yet', true); };
 $('bd-forces').onclick = () => setForceWindow(!FC.windowOpen);
 $('fp-plot').onchange = ev => { FC.plot = ev.target.value; FC.hover = null; drawForceChart(); requestRender(); };
+$('fp-elem').onchange = ev => { FC.showElem = ev.target.checked; drawForceChart(); };
 $('fp-grid').addEventListener('change', ev => {
   const id = ev.target.id;
   if (id === 'fp-rho-mode') $('fp-rho').hidden = ev.target.value !== '';
@@ -1406,6 +1442,7 @@ fpc.addEventListener('contextmenu', ev => {
     { label: 'Download wall distributions (CSV)', disabled: !has, action: () => download(`semscope_${S.meta.name}_forces_step${S.step}.csv`, forceCSV(), 'text/csv') },
     '-',
     ...Object.entries(FP_LABELS).map(([k, lab]) => ({ label: `Plot ${lab}`, checked: FC.plot === k, action: () => { FC.plot = k; $('fp-plot').value = k; FC.hover = null; drawForceChart(); requestRender(); } })),
+    { label: 'Element boundaries along the wall', checked: FC.showElem, action: () => { FC.showElem = !FC.showElem; $('fp-elem').checked = FC.showElem; drawForceChart(); } },
     '-',
     { label: 'Reset zoom', key: 'double-click', disabled: !FC.xview && !FC.yview, action: resetForceZoom },
     { label: 'Recompute', disabled: !FC.sel.size, action: () => scheduleForces(0) },
@@ -2141,6 +2178,7 @@ glCanvas.addEventListener('contextmenu', ev => {
   items.push({ label: 'Zoom to this element', disabled: !p, action: () => zoomToElement(p.e) });
   items.push({ label: 'Center view here', action: () => { pushHistory('center view'); S.view.cx = x; S.view.cy = y; requestRender(); updateProbe(); } });
   items.push({ label: 'Reset view', key: 'r', action: resetViewUser });
+  items.push({ label: 'Colormap range to the data in view', key: 'v', action: fitRangeToView });
   items.push('-');
   const lastUndo = HIST.undo[HIST.undo.length - 1], lastRedo = HIST.redo[HIST.redo.length - 1];
   items.push({ label: lastUndo ? `Undo ${lastUndo.label}` : 'Undo', key: 'Ctrl+Z', disabled: !lastUndo, action: undo });
@@ -2194,6 +2232,7 @@ $('range-auto').onchange = ev => { S.range.auto = ev.target.checked; if (S.range
 $('range-sym').onchange = ev => { S.range.sym = ev.target.checked; if (S.current) setRange(S.range.auto ? S.current.min : S.range.lo, S.range.auto ? S.current.max : S.range.hi, false); };
 const manualRange = () => { const lo = parseFloat($('vmin').value), hi = parseFloat($('vmax').value); if (Number.isFinite(lo) && Number.isFinite(hi)) { S.range.auto = false; $('range-auto').checked = false; setRange(lo, hi, true); } };
 $('vmin').onchange = manualRange; $('vmax').onchange = manualRange;
+$('btn-fit-range').onclick = fitRangeToView;
 for (const b of $('mode').querySelectorAll('button')) b.onclick = () => { S.mode = +b.dataset.mode; for (const o of $('mode').querySelectorAll('button')) o.classList.toggle('on', o === b); requestRender(); };
 $('show-edges').onchange = ev => { S.edges = ev.target.checked; requestRender(); };
 $('edge-width').oninput = ev => { S.edgeWidth = +ev.target.value; requestRender(); };
@@ -2251,6 +2290,7 @@ window.addEventListener('keydown', ev => {
     case 'g': setLineWindow(!LP.windowOpen); break;
     case 'k': setCalcWindow(!CP.windowOpen); break;
     case 'f': setForceWindow(!FC.windowOpen); break;
+    case 'v': fitRangeToView(); break;
     case 'b': toggleSidebar(); break;
     case 'Escape':
       if (!ctxEl.hidden) { closeCtx(); break; }
@@ -2357,7 +2397,7 @@ function sessionState() {
     showBoundaries: S.showBoundaries,
     chart: { open: !p.hidden, ...panelGeometry(p), grid: LP.showGrid, elem: LP.showElem, xview: LP.xview, yview: LP.yview },
     calc: { defs: calcDefs().map(d => ({ name: d.name, expr: d.expr })), open: CP.windowOpen, ...panelGeometry($('calc-panel')) },
-    forces: { open: FC.windowOpen, ...panelGeometry($('force-panel')), selection: [...FC.sel].map(id => (boundaryById(id) || {}).name).filter(Boolean), config: forceConfig(), plot: FC.plot, xview: FC.xview, yview: FC.yview },
+    forces: { open: FC.windowOpen, ...panelGeometry($('force-panel')), selection: [...FC.sel].map(id => (boundaryById(id) || {}).name).filter(Boolean), config: forceConfig(), plot: FC.plot, elem: FC.showElem, xview: FC.xview, yview: FC.yview },
   };
 }
 
@@ -2437,6 +2477,7 @@ async function applySession(sess) {
   if (fo.config) applyForceConfig(fo.config);
   if (fo.plot && FP_LABELS[fo.plot]) { FC.plot = fo.plot; setVal('fp-plot', fo.plot); }
   FC.xview = fo.xview || null; FC.yview = fo.yview || null;
+  FC.showElem = fo.elem !== false; setCheck('fp-elem', FC.showElem);
   applyPanelGeometry($('force-panel'), fo);
   renderForceBoundaries();
   setForceWindow(fo.open === true);
@@ -2507,7 +2548,7 @@ function toggleSidebar() { $('app').classList.toggle('no-sidebar'); requestRende
 const SHORTCUTS = [
   ['wheel / drag', 'zoom / pan'], ['double-click', 'reset view'], ['right-click', 'context menu'],
   ['hover / click', 'probe / pin probe'], ['Shift-drag or l', 'line probe'], ['w', 'wall-normal line'],
-  ['Ctrl while dragging', 'snap line angle to 10°'], ['Del', 'delete selected line'], ['g', 'line chart window'], ['k', 'field calculator window'], ['f', 'forces window'],
+  ['Ctrl while dragging', 'snap line angle to 10°'], ['Del', 'delete selected line'], ['g', 'line chart window'], ['k', 'field calculator window'], ['f', 'forces window'], ['v', 'colormap range to the data in view'],
   ['b', 'sidebar'], ['Space, ← →, Home, End', 'time steps'], ['1 / 2', 'spectral / nodal rendering'],
   ['m, c, n', 'element edges, iso-lines, GLL nodes'], ['r', 'reset view'], ['s', 'screenshot'],
   ['o', 'open dataset or session'], ['Ctrl+S', 'save session'], ['Ctrl+Z / Ctrl+Shift+Z', 'undo / redo'], ['Esc', 'leave a mode / unpin probe'],
@@ -2534,6 +2575,7 @@ function menuItems(name) {
   ];
   if (name === 'view') return [
     { label: 'Reset view', key: 'r', disabled: !open, action: resetViewUser },
+    { label: 'Colormap range to the data in view', key: 'v', disabled: !open, action: fitRangeToView },
     '-',
     { label: 'Line chart window', key: 'g', checked: LP.windowOpen, action: () => setLineWindow(!LP.windowOpen) },
     { label: 'Field calculator window', key: 'k', checked: CP.windowOpen, action: () => setCalcWindow(!CP.windowOpen) },
