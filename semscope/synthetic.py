@@ -1,7 +1,7 @@
 """Analytic test meshes and fields.
 
 Handy for unit tests, benchmarks and for trying the tool without a solver
-run.  All generators return :class:`~semview.dataset.SEMData2D` objects whose
+run.  All generators return :class:`~semscope.dataset.SEMData2D` objects whose
 geometry is the exact polynomial interpolant of a smooth mapping, so curved
 elements are genuinely curved.
 """

@@ -126,6 +126,26 @@ input[type=text]:focus, select:focus { border-color: var(--accent); }
 .cp-item .edit:hover { color: var(--accent); }
 .cp-item .x:hover { color: var(--danger); }
 .cp-empty { font-size: 11px; padding: 4px 6px; }
+#force-panel { width: 660px; height: 560px; min-height: 260px; }
+.fp-body { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; overflow: auto; }
+.fp-grid { display: flex; flex-direction: column; gap: 4px; }
+.fp-row { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; font-size: 12px; }
+.fp-row > label { color: var(--muted); margin-left: 4px; }
+.fp-sel { width: auto; padding: 2px 6px; font-size: 12px; }
+.fp-row input.fp-num { width: 62px; padding: 2px 6px; font-size: 11px; }
+.fp-row input.fp-name { width: 38px; padding: 2px 6px; font-size: 11px; }
+.fp-bd { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+.fp-bd label.check { font-size: 12px; gap: 4px; }
+.fp-bd .swatch, .fp-table .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; margin-right: 5px; vertical-align: -1px; }
+.fp-table { border-collapse: collapse; font-size: 11px; width: 100%; }
+.fp-table th { text-align: right; color: var(--muted); font-weight: 500; padding: 2px 8px; border-bottom: 1px solid var(--border); }
+.fp-table th:first-child, .fp-table td:first-child, .fp-table th:nth-child(2), .fp-table td:nth-child(2) { text-align: left; }
+.fp-table td { text-align: right; padding: 2px 8px; white-space: nowrap; }
+.fp-table tr.total td { border-top: 1px solid var(--border); font-weight: 600; }
+.fp-chart-head { display: flex; flex-wrap: wrap; gap: 3px 8px; align-items: center; font-size: 11px; color: var(--muted); }
+.fp-chart-head .grow { flex-basis: 100%; min-height: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fp-chart { flex: 1; min-height: 140px; position: relative; }
+#fp-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
 .lp-head { display: flex; align-items: center; gap: 8px; padding: 5px 8px 5px 10px; border-bottom: 1px solid var(--border); font-size: 11px; cursor: move; user-select: none; flex: 0 0 auto; }
 .lp-head .grow { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lp-head .btn { padding: 1px 7px; min-width: 0; font-size: 12px; }

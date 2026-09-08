@@ -1,4 +1,4 @@
-// semview GUI application: data loading, view control, overlays, probes.
+// semscope GUI application: data loading, view control, overlays, probes.
 import { Renderer } from './renderer.js';
 import { Spectral, basis } from './spectral.js';
 
@@ -177,7 +177,7 @@ async function loadMesh() {
   S.fieldCache.clear();
   const file = m.path.split('/').pop();
   $('file-info').innerHTML = `<b>${file}</b><br>${m.nelv.toLocaleString()} elements · order N = ${m.order} (${m.n}×${m.n} GLL)<br>${m.nsteps} step${m.nsteps > 1 ? 's' : ''}` + (m.mpi_ranks > 1 ? ` · read with ${m.mpi_ranks} MPI ranks` : '');
-  document.title = `semview — ${m.name}`;
+  document.title = `semscope — ${m.name}`;
 }
 
 function populateFields() {
@@ -204,6 +204,7 @@ function populateFields() {
   sel.value = S.field;
   renderCalcChips();
   renderCalcList();
+  renderForceFields();
 }
 
 function setupTime() {
@@ -353,6 +354,12 @@ function drawOverlay() {
   }
   drawBoundaries();
   drawNormalPreview();
+  if (FC.hover && FC.windowOpen) {   // point of the wall hovered in the forces chart
+    const [px, py] = dataToScreen(FC.hover.x, FC.hover.y);
+    octx.strokeStyle = FC.hover.color; octx.lineWidth = 2;
+    octx.beginPath(); octx.arc(px, py, 6, 0, 2 * Math.PI); octx.stroke();
+    octx.beginPath(); octx.moveTo(px + FC.hover.nx * 8, py - FC.hover.ny * 8); octx.lineTo(px + FC.hover.nx * 22, py - FC.hover.ny * 22); octx.stroke();
+  }
   // line probes: solid segment with end-point handles; when the chart is zoomed
   // along the distance axis, a translucent halo marks the part it shows
   const T = S.lines.length ? themeColors() : null;
@@ -618,8 +625,10 @@ function clampPanel(p = $('line-panel')) {
 function placePanel(p, corner) {
   if (p.style.left) return;
   const v = $('view').getBoundingClientRect();
+  const right = Math.max(8, v.width - p.offsetWidth - 14) + 'px', bottom = Math.max(8, v.height - p.offsetHeight - 14) + 'px';
   if (corner === 'tl') { p.style.left = '14px'; p.style.top = '56px'; }
-  else { p.style.left = Math.max(8, v.width - p.offsetWidth - 14) + 'px'; p.style.top = Math.max(8, v.height - p.offsetHeight - 14) + 'px'; }
+  else if (corner === 'tr') { p.style.left = right; p.style.top = '40px'; }
+  else { p.style.left = right; p.style.top = bottom; }
 }
 function floatingPanel(p, head, onLayout) {
   head.addEventListener('mousedown', ev => {
@@ -1008,6 +1017,7 @@ function scheduleCheck() {
 function invalidateCalc() {
   for (const key of [...S.fieldCache.keys()]) if (!isStored(key.slice(key.indexOf(':') + 1))) S.fieldCache.delete(key);
   for (const L of S.lines) if (L.field && !isStored(L.field)) L.data = null;
+  if (FC.windowOpen && FC.sel.size) scheduleForces();
 }
 
 async function defineField() {
@@ -1070,6 +1080,340 @@ for (const id of ['cp-name', 'cp-expr']) $(id).addEventListener('keydown', ev =>
 });
 floatingPanel($('calc-panel'), $('cp-head'), null);
 
+// ----------------------------------------------------------------- forces
+// Forces on selected boundaries.  The server integrates the wall traction
+// p n - mu (grad u + grad u^T) n (n pointing out of the fluid, i.e. the force
+// on the body per unit depth) with the GLL quadrature of the boundary edges.
+// The window shows pressure / viscous / total parts along configurable axes,
+// the force coefficients, and Cp or Cf along the wall.
+const FC = { windowOpen: false, sel: new Set(), result: null, token: 0, timer: null, hover: null, sig: '', plot: 'cp', layout: null, xview: null, yview: null, drag: null };
+const FORCE_SELECTS = ['fp-u', 'fp-v', 'fp-w', 'fp-p', 'fp-rho-mode', 'fp-mu-mode'];
+
+function setForceWindow(open) {
+  FC.windowOpen = !!open;
+  const p = $('force-panel');
+  p.hidden = !FC.windowOpen;
+  if (FC.windowOpen) {
+    placePanel(p, 'tr');
+    clampPanel(p);
+    p.style.zIndex = ++FLOAT.z;
+    renderForceFields(); renderForceBoundaries(); renderForceTable(); drawForceChart();
+    if (FC.sel.size) scheduleForces(0); else setForceStatus(S.boundaries.length ? 'tick the boundaries to integrate over' : 'define boundaries first (Detect or New manual… in the sidebar)');
+  } else { FC.hover = null; }
+  requestRender();
+}
+function setForceStatus(text, cls = 'muted') { const el = $('fp-status'); el.textContent = text; el.className = 'cp-status mono ' + cls; }
+
+/** (Re)fill a select with field names, keeping the user's choice when it still exists. */
+function fillSelect(sel, names, fallback, noneLabel = null) {
+  const prev = sel.dataset.populated === '1' ? sel.value : null;
+  sel.innerHTML = '';
+  if (noneLabel !== null) { const o = document.createElement('option'); o.value = ''; o.textContent = noneLabel; sel.appendChild(o); }
+  for (const nm of names) { const o = document.createElement('option'); o.value = nm; o.textContent = nm; sel.appendChild(o); }
+  let want;
+  if (prev !== null && (names.includes(prev) || (prev === '' && noneLabel !== null))) want = prev;
+  else if (fallback && names.includes(fallback)) want = fallback;
+  else want = noneLabel !== null ? '' : (names[0] || '');
+  sel.value = want;
+  sel.dataset.populated = '1';
+}
+function renderForceFields() {
+  if (!S.meta || !S.meta.open) return;
+  const names = S.meta.available;
+  fillSelect($('fp-u'), names, 'u'); fillSelect($('fp-v'), names, 'v'); fillSelect($('fp-w'), names, 'w', '—'); fillSelect($('fp-p'), names, 'p');
+  fillSelect($('fp-rho-mode'), names, '', 'constant'); fillSelect($('fp-mu-mode'), names, '', 'constant');
+  $('fp-rho').hidden = $('fp-rho-mode').value !== ''; $('fp-mu').hidden = $('fp-mu-mode').value !== '';
+}
+function resetForceWindow() {
+  FC.sel.clear(); FC.result = null; FC.hover = null; FC.sig = ''; FC.xview = null; FC.yview = null;
+  for (const id of FORCE_SELECTS) $(id).dataset.populated = '';
+  renderForceTable();
+  if (FC.windowOpen) drawForceChart();
+}
+
+const fnum = (id, def) => { const v = parseFloat($(id).value); return Number.isFinite(v) ? v : def; };
+/** The request / session description of the force settings, read from the inputs. */
+function forceConfig() {
+  const rhoMode = $('fp-rho-mode').value, muMode = $('fp-mu-mode').value;
+  return {
+    u: $('fp-u').value, v: $('fp-v').value, w: $('fp-w').value || null, p: $('fp-p').value,
+    rho: rhoMode || fnum('fp-rho', 1), mu: muMode || fnum('fp-mu', 1),
+    U_ref: fnum('fp-U', 1), L_ref: fnum('fp-L', 1), p_ref: fnum('fp-pref', 0),
+    rho_ref: $('fp-rhoref').value.trim() === '' ? null : fnum('fp-rhoref', 1),
+    axes: [
+      { name: $('fp-a1').value.trim() || 'x', dir: [fnum('fp-a1x', 1), fnum('fp-a1y', 0)] },
+      { name: $('fp-a2').value.trim() || 'y', dir: [fnum('fp-a2x', 0), fnum('fp-a2y', 1)] },
+    ],
+  };
+}
+function applyForceConfig(c) {
+  if (!c) return;
+  renderForceFields();
+  const setSel = (id, v) => { const el = $(id); if (v === undefined || v === null) return; if ([...el.options].some(o => o.value === v)) el.value = v; };
+  setSel('fp-u', c.u); setSel('fp-v', c.v); setSel('fp-w', c.w || ''); setSel('fp-p', c.p);
+  for (const [k, mode, val] of [['rho', 'fp-rho-mode', 'fp-rho'], ['mu', 'fp-mu-mode', 'fp-mu']]) {
+    if (c[k] === undefined || c[k] === null) continue;
+    if (typeof c[k] === 'string') setSel(mode, c[k]); else { $(mode).value = ''; $(val).value = c[k]; }
+    $(val).hidden = $(mode).value !== '';
+  }
+  for (const [k, id] of [['U_ref', 'fp-U'], ['L_ref', 'fp-L'], ['p_ref', 'fp-pref']]) if (c[k] !== undefined && c[k] !== null) $(id).value = c[k];
+  $('fp-rhoref').value = c.rho_ref === undefined || c.rho_ref === null ? '' : c.rho_ref;
+  if (c.axes && c.axes.length >= 2) {
+    $('fp-a1').value = c.axes[0].name; $('fp-a1x').value = c.axes[0].dir[0]; $('fp-a1y').value = c.axes[0].dir[1];
+    $('fp-a2').value = c.axes[1].name; $('fp-a2x').value = c.axes[1].dir[0]; $('fp-a2y').value = c.axes[1].dir[1];
+  }
+}
+
+const forceSig = () => S.boundaries.filter(b => FC.sel.has(b.id)).map(b => `${b.id}:${b.name}:${b.edges.length}:${b.edges.join(',')}`).join('|');
+/** Checkbox list of the boundaries; recomputes when a selected boundary changed (edited, renamed, undone). */
+function renderForceBoundaries() {
+  const box = $('fp-bd');
+  const ids = new Set(S.boundaries.map(b => b.id));
+  for (const id of [...FC.sel]) if (!ids.has(id)) FC.sel.delete(id);
+  box.innerHTML = '';
+  if (!S.boundaries.length) { const e = document.createElement('span'); e.className = 'muted'; e.textContent = 'none yet — Detect or New manual… in the Boundaries section'; box.appendChild(e); }
+  for (const b of S.boundaries) {
+    const lab = document.createElement('label'); lab.className = 'check';
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = FC.sel.has(b.id);
+    cb.onchange = () => { if (cb.checked) FC.sel.add(b.id); else FC.sel.delete(b.id); FC.xview = null; FC.yview = null; scheduleForces(0); };
+    const sw = document.createElement('i'); sw.className = 'swatch'; sw.style.background = bdColor(b);
+    lab.append(cb, sw, document.createTextNode(`${b.name} (${b.edges.length})`));
+    lab.title = `${b.edges.length} edge${b.edges.length === 1 ? '' : 's'}${b.source === 'auto' ? ', detected' : ', manual'}`;
+    box.appendChild(lab);
+  }
+  if (FC.windowOpen && forceSig() !== FC.sig) scheduleForces();
+}
+
+function scheduleForces(delay = 150) {
+  clearTimeout(FC.timer);
+  FC.sig = forceSig();
+  FC.timer = setTimeout(computeForces, delay);
+}
+async function computeForces() {
+  if (!S.meta || !S.meta.open) return;
+  const bds = S.boundaries.filter(b => FC.sel.has(b.id) && b.edges.length);
+  if (!bds.length) {
+    FC.result = null; FC.hover = null; renderForceTable(); drawForceChart();
+    setForceStatus(S.boundaries.length ? 'tick the boundaries to integrate over' : 'define boundaries first (Detect or New manual… in the sidebar)');
+    requestRender(); return;
+  }
+  const token = ++FC.token;
+  try {
+    const out = await post('forces', { step: S.step, boundaries: bds.map(b => ({ name: b.name, edges: b.edges })), ...forceConfig() });
+    if (token !== FC.token) return;
+    out.ids = bds.map(b => b.id);
+    FC.result = out; FC.hover = null; $('fp-hover').textContent = '';
+    renderForceTable(); drawForceChart();
+    setForceStatus(`q = ½ ρ_ref U² = ${fmt(out.q, 5)} with ρ_ref = ${fmt(out.rho_ref, 5)}   ·   step ${out.step}, t = ${fmt(out.time, 6)}   ·   forces per unit depth, on the body`);
+  } catch (err) { setForceStatus('✗ ' + err.message, 'err'); }
+  requestRender();
+}
+
+const forceColor = (R, i) => bdColor(boundaryById(R.ids[i]) || { colorIdx: i });
+function renderForceTable() {
+  const t = $('fp-table'); t.innerHTML = '';
+  const R = FC.result;
+  $('fp-info').textContent = R ? `${R.boundaries.length} boundar${R.boundaries.length === 1 ? 'y' : 'ies'} · L = ${fmt(R.total.length, 5)}` : '';
+  if (!R) return;
+  const head = t.createTHead().insertRow();
+  for (const h of ['boundary', 'axis', 'pressure', 'viscous', 'total', 'coefficient']) { const th = document.createElement('th'); th.textContent = h; head.appendChild(th); }
+  const body = t.createTBody();
+  const block = (res, label, color, cls) => {
+    const rows = res.axes.map(a => ({ ...a }));
+    if (res.components.length === 3) rows.push({ name: 'z', pressure: res.pressure[2], viscous: res.viscous[2], total: res.total[2], coefficient: res.total[2] / (res.q * res.L_ref) });
+    rows.forEach((a, i) => {
+      const tr = body.insertRow(); if (cls) tr.className = cls;
+      const c0 = tr.insertCell();
+      if (i === 0) {
+        if (color) { const sw = document.createElement('i'); sw.className = 'swatch'; sw.style.background = color; c0.appendChild(sw); }
+        c0.appendChild(document.createTextNode(label));
+        c0.title = `${res.nedges} edges, length ${fmt(res.length, 6)}`;
+      }
+      tr.insertCell().textContent = a.name;
+      for (const k of ['pressure', 'viscous', 'total']) tr.insertCell().textContent = fmt(a[k], 5);
+      tr.insertCell().textContent = `C${a.name} = ${fmt(a.coefficient, 5)}`;
+    });
+  };
+  R.boundaries.forEach((res, i) => block(res, res.name, forceColor(R, i), ''));
+  if (R.boundaries.length > 1) block(R.total, `Σ ${R.boundaries.length}`, null, 'total');
+}
+
+const FP_LABELS = { cp: 'Cp', cf: 'Cf', p: 'p', tau: 'τw' };
+function drawForceChart() {
+  const c = $('fp-canvas'), dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (!w || !h || $('force-panel').hidden) return;
+  const Wd = Math.round(w * dpr), Hd = Math.round(h * dpr);
+  if (c.width !== Wd || c.height !== Hd) { c.width = Wd; c.height = Hd; }
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const light = isLight();
+  const fg = light ? '#1b2130' : '#e6e9f0', dim = light ? 'rgba(27,33,48,.45)' : 'rgba(230,233,240,.45)', grid = light ? 'rgba(27,33,48,.1)' : 'rgba(230,233,240,.1)';
+  ctx.font = '10px ui-monospace, Menlo, Consolas, monospace';
+  FC.layout = null;
+  const R = FC.result;
+  if (!R) { ctx.fillStyle = dim; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('Cp and Cf along the selected boundaries appear here', w / 2, h / 2); return; }
+  const key = FC.plot;
+  const series = R.boundaries.map((res, i) => ({ res, color: forceColor(R, i), s: res.dist.s, v: res.dist[key], chain: res.dist.chain }));
+  // full arc-length extent, then the zoomed window (wheel / drag), then the value range of what is visible
+  let smax = 0;
+  for (const q of series) for (let i = 0; i < q.s.length; i++) if (q.v[i] !== null && q.s[i] > smax) smax = q.s[i];
+  if (!(smax > 0)) smax = 1;
+  let s0 = 0, s1 = smax;
+  if (FC.xview) { s0 = clamp(FC.xview.s0, 0, smax); s1 = clamp(FC.xview.s1, 0, smax); if (s1 - s0 < smax * 1e-9) { s0 = 0; s1 = smax; FC.xview = null; } }
+  let lo = Infinity, hi = -Infinity;
+  for (const q of series) for (let i = 0; i < q.s.length; i++) { const y = q.v[i]; if (y === null || q.s[i] < s0 || q.s[i] > s1) continue; if (y < lo) lo = y; if (y > hi) hi = y; }
+  if (!(lo <= hi)) { lo = -1; hi = 1; } else if (lo === hi) { lo -= 0.5; hi += 0.5; } else { const pad = 0.06 * (hi - lo); lo -= pad; hi += pad; }
+  if (FC.yview) { lo = FC.yview.lo; hi = FC.yview.hi; }
+  const pad = { l: 58, r: 12, t: 8, b: 24 }, pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
+  const X = s => pad.l + (s - s0) / (s1 - s0) * pw, Y = v => pad.t + (1 - (v - lo) / (hi - lo)) * ph;
+  // grid and ticks
+  const sx = niceStep(s1 - s0, pw / 90), sy = niceStep(hi - lo, ph / 40);
+  ctx.strokeStyle = grid; ctx.lineWidth = 1; ctx.fillStyle = fg;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  for (let s = Math.ceil(s0 / sx) * sx; s <= s1 + 1e-9 * smax; s += sx) { const px = X(s); ctx.beginPath(); ctx.moveTo(px, pad.t); ctx.lineTo(px, pad.t + ph); ctx.stroke(); ctx.fillText(tickFmt(s, sx), px, pad.t + ph + 4); }
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  for (let v = Math.ceil(lo / sy) * sy; v <= hi; v += sy) { const py = Y(v); ctx.beginPath(); ctx.moveTo(pad.l, py); ctx.lineTo(pad.l + pw, py); ctx.stroke(); ctx.fillText(tickFmt(v, sy), pad.l - 5, py); }
+  if (lo < 0 && hi > 0) { ctx.strokeStyle = dim; ctx.beginPath(); ctx.moveTo(pad.l, Y(0)); ctx.lineTo(pad.l + pw, Y(0)); ctx.stroke(); }
+  ctx.strokeStyle = dim; ctx.strokeRect(pad.l + 0.5, pad.t + 0.5, pw, ph);
+  ctx.fillStyle = dim; ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'; ctx.fillText((FC.xview || FC.yview) ? 'arc length s  (zoomed — double-click to reset)' : 'arc length s', pad.l + pw, pad.t + ph - 3);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillText(FP_LABELS[key], pad.l + 4, pad.t + 3);
+  // curves (one polyline per chain of connected edges)
+  ctx.save(); ctx.beginPath(); ctx.rect(pad.l, pad.t, pw, ph); ctx.clip();
+  for (const q of series) {
+    ctx.strokeStyle = q.color; ctx.lineWidth = 1.4; ctx.beginPath();
+    let prev = -1;
+    for (let i = 0; i < q.s.length; i++) {
+      if (q.v[i] === null) { prev = -1; continue; }
+      const px = X(q.s[i]), py = Y(q.v[i]);
+      if (q.chain[i] !== prev) { ctx.moveTo(px, py); prev = q.chain[i]; } else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+  if (FC.hover && FC.hover.v !== null && FC.hover.key === key && FC.hover.s >= s0 && FC.hover.s <= s1) {
+    ctx.strokeStyle = FC.hover.color; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(X(FC.hover.s), Y(FC.hover.v), 4, 0, 2 * Math.PI); ctx.stroke();
+    ctx.strokeStyle = dim; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(X(FC.hover.s), pad.t); ctx.lineTo(X(FC.hover.s), pad.t + ph); ctx.stroke(); ctx.setLineDash([]);
+  }
+  FC.layout = { pad, pw, ph, smax, s0, s1, lo, hi, series, X, Y };
+}
+
+const fpc = $('fp-canvas');
+const fpPos = ev => { const r = fpc.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; };
+const fpArc = mx => { const L = FC.layout; return L.s0 + (mx - L.pad.l) / L.pw * (L.s1 - L.s0); };
+const resetForceZoom = () => { FC.xview = null; FC.yview = null; drawForceChart(); requestRender(); };
+fpc.addEventListener('mousemove', ev => {
+  const L = FC.layout; if (!L || FC.drag) return;
+  const [mx, my] = fpPos(ev);
+  let best = null, bd = Infinity;
+  for (const q of L.series) for (let i = 0; i < q.s.length; i++) {
+    if (q.v[i] === null || q.s[i] < L.s0 || q.s[i] > L.s1) continue;
+    const dx = L.X(q.s[i]) - mx, dy = L.Y(q.v[i]) - my, d = dx * dx + 0.15 * dy * dy;   // mostly by arc length
+    if (d < bd) { bd = d; best = { q, i }; }
+  }
+  if (!best) return;
+  const { q, i } = best, d = q.res.dist;
+  FC.hover = { key: FC.plot, x: d.x[i], y: d.y[i], nx: d.nx[i], ny: d.ny[i], s: d.s[i], v: q.v[i], color: q.color };
+  $('fp-hover').textContent = `${q.res.name}: s = ${fmt(d.s[i], 5)}   (${fmt(d.x[i], 5)}, ${fmt(d.y[i], 5)})   Cp ${fmt(d.cp[i], 4)}   Cf ${fmt(d.cf[i], 4)}   p ${fmt(d.p[i], 4)}   τw ${fmt(d.tau[i], 4)}`;
+  drawForceChart(); requestRender();
+});
+fpc.addEventListener('mouseleave', () => { if (FC.drag) return; FC.hover = null; $('fp-hover').textContent = ''; drawForceChart(); requestRender(); });
+// zoom: wheel along the arc length, Shift+wheel along the value axis; drag pans; double-click resets
+fpc.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  const L = FC.layout; if (!L) return;
+  const [mx, my] = fpPos(ev);
+  const f = Math.exp(ev.deltaY * (ev.deltaMode === 1 ? 0.05 : 0.0015));
+  if (ev.shiftKey) {
+    const v = L.lo + (1 - (my - L.pad.t) / L.ph) * (L.hi - L.lo);
+    FC.yview = { lo: v - (v - L.lo) * f, hi: v + (L.hi - v) * f };
+  } else {
+    const sm = clamp(fpArc(mx), L.s0, L.s1);
+    const a = Math.max(0, sm - (sm - L.s0) * f), b = Math.min(L.smax, sm + (L.s1 - sm) * f);
+    if (b - a < L.smax * 1e-6) return;
+    FC.xview = (a <= 0 && b >= L.smax) ? null : { s0: a, s1: b };
+  }
+  drawForceChart(); requestRender();
+}, { passive: false });
+fpc.addEventListener('mousedown', ev => {
+  const L = FC.layout; if (!L || ev.button !== 0) return;
+  const [mx, my] = fpPos(ev);
+  FC.drag = { mx, my, s0: L.s0, s1: L.s1, yview: FC.yview ? { ...FC.yview } : { lo: L.lo, hi: L.hi }, L, moved: false };
+  ev.preventDefault();
+});
+function fcDrag(ev) {
+  const D = FC.drag, L = D.L;
+  const [mx, my] = fpPos(ev);
+  const dx = mx - D.mx, dy = my - D.my;
+  if (Math.abs(dx) + Math.abs(dy) > 2) D.moved = true;
+  if (!D.moved) return;
+  const width = D.s1 - D.s0;
+  const a = clamp(D.s0 - dx / L.pw * width, 0, Math.max(0, L.smax - width));
+  FC.xview = (a <= 0 && a + width >= L.smax) ? null : { s0: a, s1: a + width };
+  const dv = dy / L.ph * (D.yview.hi - D.yview.lo);
+  FC.yview = { lo: D.yview.lo + dv, hi: D.yview.hi + dv };
+  drawForceChart(); requestRender();
+}
+fpc.addEventListener('dblclick', resetForceZoom);
+$('fp-reset').onclick = resetForceZoom;
+
+/** Tab-separated force table (for the clipboard). */
+function forceTableText() {
+  const R = FC.result; if (!R) return '';
+  const cfg = forceConfig();
+  const rows = [`# forces on the body per unit depth, step ${R.step}, t = ${R.time}`, `# u=${cfg.u} v=${cfg.v}${cfg.w ? ` w=${cfg.w}` : ''} p=${cfg.p} rho=${cfg.rho} mu=${cfg.mu}  q = ${R.q} (rho_ref ${R.rho_ref}, U_ref ${cfg.U_ref}), L_ref ${cfg.L_ref}, p_ref ${cfg.p_ref}`, 'boundary\tlength\taxis\tdir_x\tdir_y\tpressure\tviscous\ttotal\tcoefficient'];
+  const block = (res, label) => {
+    for (const a of res.axes) rows.push(`${label}\t${res.length}\t${a.name}\t${a.dir[0]}\t${a.dir[1]}\t${a.pressure}\t${a.viscous}\t${a.total}\t${a.coefficient}`);
+    if (res.components.length === 3) rows.push(`${label}\t${res.length}\tz\t0\t0\t${res.pressure[2]}\t${res.viscous[2]}\t${res.total[2]}\t${res.total[2] / (res.q * res.L_ref)}`);
+  };
+  for (const res of R.boundaries) block(res, res.name);
+  if (R.boundaries.length > 1) block(R.total, 'total');
+  return rows.join('\n') + '\n';
+}
+/** CSV of the wall distributions of every computed boundary. */
+function forceCSV() {
+  const R = FC.result; if (!R) return '';
+  const rows = ['boundary,s,x,y,nx,ny,p,cp,tau_w,cf'];
+  for (const res of R.boundaries) { const d = res.dist; for (let i = 0; i < d.s.length; i++) rows.push(`${res.name},${d.s[i]},${d.x[i]},${d.y[i]},${d.nx[i]},${d.ny[i]},${d.p[i]},${d.cp[i]},${d.tau[i]},${d.cf[i]}`); }
+  return rows.join('\n') + '\n';
+}
+
+$('fp-close').onclick = () => setForceWindow(false);
+$('fp-copy').onclick = () => { if (FC.result) copyText(forceTableText(), 'Force table copied'); else toast('Nothing computed yet', true); };
+$('bd-forces').onclick = () => setForceWindow(!FC.windowOpen);
+$('fp-plot').onchange = ev => { FC.plot = ev.target.value; FC.hover = null; drawForceChart(); requestRender(); };
+$('fp-grid').addEventListener('change', ev => {
+  const id = ev.target.id;
+  if (id === 'fp-rho-mode') $('fp-rho').hidden = ev.target.value !== '';
+  if (id === 'fp-mu-mode') $('fp-mu').hidden = ev.target.value !== '';
+  if (id === 'fp-alpha') {   // rotate both axes
+    const a = fnum('fp-alpha', 0) * Math.PI / 180, r = v => Math.round(v * 1e6) / 1e6;
+    $('fp-a1x').value = r(Math.cos(a)); $('fp-a1y').value = r(Math.sin(a)); $('fp-a2x').value = r(-Math.sin(a)); $('fp-a2y').value = r(Math.cos(a));
+  }
+  if (ev.target.type === 'checkbox') return;   // boundary checkboxes schedule themselves
+  scheduleForces(0);
+});
+$('fp-grid').addEventListener('keydown', ev => { if (ev.key === 'Enter' && ev.target.tagName === 'INPUT') { ev.preventDefault(); ev.target.blur(); } });
+fpc.addEventListener('contextmenu', ev => {
+  ev.preventDefault();
+  const has = !!FC.result;
+  openCtx([
+    { header: has ? `${FC.result.boundaries.map(b => b.name).join(', ')} — ${FP_LABELS[FC.plot]} along the wall` : 'forces' },
+    { label: 'Copy force table', disabled: !has, action: () => copyText(forceTableText(), 'Force table copied') },
+    { label: 'Copy wall distributions (CSV)', disabled: !has, action: () => copyText(forceCSV(), 'Distributions copied') },
+    { label: 'Download wall distributions (CSV)', disabled: !has, action: () => download(`semscope_${S.meta.name}_forces_step${S.step}.csv`, forceCSV(), 'text/csv') },
+    '-',
+    ...Object.entries(FP_LABELS).map(([k, lab]) => ({ label: `Plot ${lab}`, checked: FC.plot === k, action: () => { FC.plot = k; $('fp-plot').value = k; FC.hover = null; drawForceChart(); requestRender(); } })),
+    '-',
+    { label: 'Reset zoom', key: 'double-click', disabled: !FC.xview && !FC.yview, action: resetForceZoom },
+    { label: 'Recompute', disabled: !FC.sel.size, action: () => scheduleForces(0) },
+    { label: 'Hide this window (settings are kept)', key: 'f', action: () => setForceWindow(false) },
+  ], ev.clientX, ev.clientY);
+});
+floatingPanel($('force-panel'), $('fp-head'), drawForceChart);
+
 // ----------------------------------------------------------------- mouse interaction
 overlay.style.pointerEvents = 'none';
 glCanvas.addEventListener('wheel', ev => {
@@ -1121,6 +1465,7 @@ glCanvas.addEventListener('mousedown', ev => {
 });
 window.addEventListener('mousemove', ev => {
   if (LP.drag) { lpDrag(ev); return; }
+  if (FC.drag) { fcDrag(ev); return; }
   if (FLOAT.drag) {
     const { p, dx, dy } = FLOAT.drag;
     p.style.left = (ev.clientX - dx) + 'px'; p.style.top = (ev.clientY - dy) + 'px';
@@ -1184,7 +1529,7 @@ double-click: whole run up to the corners` : 'hover an external edge';
   }
 });
 window.addEventListener('mouseup', ev => {
-  LP.drag = null; FLOAT.drag = null;
+  LP.drag = null; FLOAT.drag = null; FC.drag = null;
   if (!S.drag || (S.drag.kind === 'line' && S.drag.fromMenu)) return;
   const d = S.drag; S.drag = null;
   if (d.kind === 'line') {
@@ -1287,7 +1632,7 @@ async function detectBoundaries() {
     const G = await ensureGroups();
     pushHistory('detect boundaries');
     S.boundaries = S.boundaries.filter(b => b.source !== 'auto');
-    for (const g of G.groups) { const b = newBoundary('auto', g.name); b.edges = g.edges.slice(); b.closed = g.closed; }
+    G.groups.forEach((g, gi) => { const b = newBoundary('auto', g.name); b.edges = g.edges.slice(); b.closed = g.closed; b.group = gi; });
     renderBoundaryList(); requestRender();
     toast(`${G.groups.length} boundar${G.groups.length === 1 ? 'y' : 'ies'} at a ${BD.angle}° feature angle`);
   } catch (err) { toast(err.message, true); }
@@ -1397,6 +1742,7 @@ function renderBoundaryList() {
     row.append(cb, sw, nm, cnt, ed, x);
     box.appendChild(row);
   }
+  renderForceBoundaries();
 }
 
 function drawBoundaries() {
@@ -1605,7 +1951,7 @@ $('nl-snap').onchange = ev => { NL.snap = ev.target.checked; NL.hover = null; re
 // ----------------------------------------------------------------- collapsible sidebar sections
 (function makeCollapsible() {
   let saved = {};
-  try { saved = JSON.parse(localStorage.getItem('semview.collapsed') || '{}'); } catch { /* ignore */ }
+  try { saved = JSON.parse(localStorage.getItem('semscope.collapsed') || '{}'); } catch { /* ignore */ }
   for (const panel of document.querySelectorAll('#sidebar .panel')) {
     const h2 = panel.querySelector('h2');
     if (!h2) continue;
@@ -1620,7 +1966,7 @@ $('nl-snap').onchange = ev => { NL.snap = ev.target.checked; NL.hover = null; re
     h2.addEventListener('click', () => {
       panel.classList.toggle('collapsed');
       saved[key] = panel.classList.contains('collapsed');
-      try { localStorage.setItem('semview.collapsed', JSON.stringify(saved)); } catch { /* ignore */ }
+      try { localStorage.setItem('semscope.collapsed', JSON.stringify(saved)); } catch { /* ignore */ }
     });
   }
 })();
@@ -1666,23 +2012,34 @@ function pythonSnippet() {
   if (S.invert) cmap = cmap.endsWith('_r') ? cmap.slice(0, -2) : cmap + '_r';
   const field = S.field;
   const lines = [
-    'import semview',
+    'import semscope',
     '',
-    `data = semview.load(${JSON.stringify(S.meta.path)}, step=${S.step})`,
+    `data = semscope.load(${JSON.stringify(S.meta.path)}, step=${S.step})`,
   ];
   for (const d of calcDefs()) lines.push(`data.define(${JSON.stringify(d.name)}, ${JSON.stringify(d.expr)})`);
   lines.push(
-    'pl = semview.Plotter(figsize=(9, 6))',
+    'pl = semscope.Plotter(figsize=(9, 6))',
     `pl.add_field(data, ${JSON.stringify(field)}, cmap=${JSON.stringify(cmap)}, clim=(${fmt(S.range.lo, 6)}, ${fmt(S.range.hi, 6)})${S.mode === 1 ? ', method="nodal"' : ''})`,
   );
   if (S.contours) lines.push(`pl.add_contours(data, ${JSON.stringify(field)}, levels=${S.nContours}, colors="w", linewidths=0.5)`);
   if (S.edges) lines.push('pl.add_mesh(data, color="k", linewidth=0.3)');
   if (S.nodes) lines.push('pl.add_nodes(data)');
-  if (S.boundaries.some(b => b.source === 'auto' && b.visible)) lines.push(`boundaries = data.detect_boundaries(angle=${BD.angle})`, 'pl.add_boundaries(data, boundaries)');
-  if (BD.ext) for (const b of S.boundaries) if (b.source !== 'auto' && b.visible && b.edges.length) {
-    const pairs = b.edges.map(i => `(${BD.ext.ids[2 * i]}, ${BD.ext.ids[2 * i + 1]})`).join(', ');
-    const v = b.name.replace(/\W+/g, '_');
-    lines.push(`b_${v} = data.boundary([${pairs}], name=${JSON.stringify(b.name)})`, `pl.add_boundaries(data, [b_${v}])`);
+  const bvar = b => 'b_' + b.name.replace(/\W+/g, '_');
+  const wanted = BD.ext ? S.boundaries.filter(b => b.edges.length && (b.visible || FC.sel.has(b.id))) : [];
+  if (wanted.some(b => b.source === 'auto')) lines.push(`boundaries = data.detect_boundaries(angle=${BD.angle})`);
+  for (const b of wanted) {
+    if (b.source === 'auto') lines.push(b.group !== undefined && b.group !== null ? `${bvar(b)} = boundaries[${b.group}]   # ${b.name}` : `${bvar(b)} = next(b for b in boundaries if b.name == ${JSON.stringify(b.name)})`);
+    else lines.push(`${bvar(b)} = data.boundary([${b.edges.map(i => `(${BD.ext.ids[2 * i]}, ${BD.ext.ids[2 * i + 1]})`).join(', ')}], name=${JSON.stringify(b.name)})`);
+  }
+  const shown = wanted.filter(b => b.visible);
+  if (shown.length) lines.push(`pl.add_boundaries(data, [${shown.map(bvar).join(', ')}])`);
+  const forced = wanted.filter(b => FC.sel.has(b.id));
+  if (forced.length) {
+    const c = forceConfig(), lit = v => (typeof v === 'string' ? JSON.stringify(v) : String(v));
+    const kw = [`u=${lit(c.u)}`, `v=${lit(c.v)}`, c.w ? `w=${lit(c.w)}` : null, `p=${lit(c.p)}`, `rho=${lit(c.rho)}`, `mu=${lit(c.mu)}`,
+      `axes={${c.axes.map(a => `${JSON.stringify(a.name)}: (${a.dir[0]}, ${a.dir[1]})`).join(', ')}}`,
+      `U_ref=${c.U_ref}`, `L_ref=${c.L_ref}`, `p_ref=${c.p_ref}`, c.rho_ref !== null ? `rho_ref=${c.rho_ref}` : null].filter(Boolean).join(', ');
+    for (const b of forced) lines.push(`F_${bvar(b).slice(2)} = data.forces(${bvar(b)}, ${kw})`, `print(F_${bvar(b).slice(2)})   # pressure / viscous parts, coefficients; .distribution has Cp, Cf along the wall`);
   }
   for (const L of S.lines) {
     if (L.kind === 'normal' && L.anchor) {
@@ -1696,7 +2053,7 @@ function pythonSnippet() {
   if (S.probePinned) lines.push(`probe = data.sample(${JSON.stringify(field)}, ${fmt(S.probePinned.x, 7)}, ${fmt(S.probePinned.y, 7)})`);
   lines.push(`pl.set_view((${fmt(x0, 7)}, ${fmt(x1, 7)}), (${fmt(y0, 7)}, ${fmt(y1, 7)}))`);
   lines.push(`pl.set_title(${JSON.stringify(`${S.meta.name}: ${S.field}`)})`);
-  lines.push('pl.save("semview_view.png")');
+  lines.push('pl.save("semscope_view.png")');
   return lines.join('\n') + '\n';
 }
 
@@ -1766,7 +2123,7 @@ glCanvas.addEventListener('contextmenu', ev => {
     items.push({ header: `line ${lineName(L)}: (${fmt(L.x0, 5)}, ${fmt(L.y0, 5)}) → (${fmt(L.x1, 5)}, ${fmt(L.y1, 5)})` });
     items.push({ label: L.visible ? `Hide ${lineName(L)} in the chart` : `Show ${lineName(L)} in the chart`, action: () => { pushHistory(`${L.visible ? 'hide' : 'show'} ${lineName(L)}`); L.visible = !L.visible; renderLegend(); showLinePanel(); drawLineChart(); requestRender(); } });
     items.push({ label: `Copy ${lineName(L)} samples (CSV)`, disabled: !L.data, action: () => copyText(lineCSV([L]), `${lineName(L)} samples copied`) });
-    items.push({ label: `Download ${lineName(L)} samples (CSV)`, disabled: !L.data, action: () => download(`semview_${S.meta.name}_${S.field}_${lineName(L)}.csv`, lineCSV([L]), 'text/csv') });
+    items.push({ label: `Download ${lineName(L)} samples (CSV)`, disabled: !L.data, action: () => download(`semscope_${S.meta.name}_${S.field}_${lineName(L)}.csv`, lineCSV([L]), 'text/csv') });
     items.push({ label: `Copy end points of ${lineName(L)}`, action: () => copyText(`${L.x0}\t${L.y0}\n${L.x1}\t${L.y1}`, 'End points copied') });
     items.push({ label: `Delete ${lineName(L)}`, key: 'Del', action: () => removeLine(L) });
   }
@@ -1801,7 +2158,7 @@ lpc.addEventListener('contextmenu', ev => {
   const items = [
     { header: `${S.field} along ${vis.length} visible line${vis.length === 1 ? '' : 's'}` },
     { label: 'Copy samples of visible lines (CSV)', disabled: !vis.length, action: () => copyText(lineCSV(vis), 'Samples copied') },
-    { label: 'Download samples of visible lines (CSV)', disabled: !vis.length, action: () => download(`semview_${S.meta.name}_${S.field}_lines.csv`, lineCSV(vis), 'text/csv') },
+    { label: 'Download samples of visible lines (CSV)', disabled: !vis.length, action: () => download(`semscope_${S.meta.name}_${S.field}_lines.csv`, lineCSV(vis), 'text/csv') },
     '-',
     { label: 'Reset zoom', key: 'double-click', action: resetChartZoom },
     { label: 'Hide this window (lines are kept)', key: 'g', action: () => setLineWindow(false) },
@@ -1826,6 +2183,7 @@ function setStep(i) {
   S.step = clamp(i, 0, S.meta.nsteps - 1);
   $('step-slider').value = S.step;
   loadField();
+  if (FC.windowOpen && FC.sel.size) scheduleForces();
 }
 
 // ----------------------------------------------------------------- controls wiring
@@ -1846,7 +2204,7 @@ $('node-size').oninput = ev => { S.nodeSize = +ev.target.value; requestRender();
 $('show-axes').onchange = ev => { S.axes = ev.target.checked; requestRender(); };
 $('show-colorbar').onchange = ev => { S.colorbar = ev.target.checked; requestRender(); };
 $('quality').onchange = ev => { S.pxPerCell = +ev.target.value; requestRender(); };
-$('bg').onchange = ev => { S.bg = ev.target.value; document.body.classList.toggle('light', isLight()); if (S.lines.length) { renderLegend(); drawLineChart(); } requestRender(); };
+$('bg').onchange = ev => { S.bg = ev.target.value; document.body.classList.toggle('light', isLight()); if (S.lines.length) { renderLegend(); drawLineChart(); } if (FC.windowOpen) drawForceChart(); requestRender(); };
 $('step-slider').oninput = ev => setStep(+ev.target.value);
 $('btn-play').onclick = () => setPlaying(!S.playing);
 $('btn-first').onclick = () => setStep(0);
@@ -1892,6 +2250,7 @@ window.addEventListener('keydown', ev => {
     case 'w': setNormalMode(!NL.mode); break;
     case 'g': setLineWindow(!LP.windowOpen); break;
     case 'k': setCalcWindow(!CP.windowOpen); break;
+    case 'f': setForceWindow(!FC.windowOpen); break;
     case 'b': toggleSidebar(); break;
     case 'Escape':
       if (!ctxEl.hidden) { closeCtx(); break; }
@@ -1919,7 +2278,7 @@ function screenshot() {
   out.toBlob(blob => {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `semview_${S.meta ? S.meta.name : 'view'}_${S.field}_step${S.step}.png`;
+    a.download = `semscope_${S.meta ? S.meta.name : 'view'}_${S.field}_step${S.step}.png`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   }, 'image/png');
@@ -1952,17 +2311,17 @@ function closeDialog() { $('dialog').hidden = true; }
 $('dlg-close').onclick = closeDialog;
 $('dialog').addEventListener('click', ev => { if (ev.target === $('dialog')) closeDialog(); });
 $('dlg-up').onclick = () => browse($('dlg-path').dataset.parent);
-$('dlg-go').onclick = () => { const p = $('dlg-path').value.trim(); if (/\.nek5000$|\d\.f\d{5}$|\.semview\.json$/.test(p)) openPath(p); else browse(p); };
+$('dlg-go').onclick = () => { const p = $('dlg-path').value.trim(); if (/\.nek5000$|\d\.f\d{5}$|\.sem(scope|view)\.json$/.test(p)) openPath(p); else browse(p); };
 $('dlg-path').addEventListener('keydown', ev => { if (ev.key === 'Enter') $('dlg-go').click(); });
 
 async function openPath(path, opts = {}) {
   closeDialog();
-  if (path.endsWith(SESSION_SUFFIX)) return loadSessionPath(path);
+  if (isSessionFile(path)) return loadSessionPath(path);
   toast(`Opening ${path.split('/').pop()} …`);
   try {
     setPlaying(false);
     S.probePinned = null; clearLines(false); clearHistory();
-    setPickMode(false); setNormalMode(false); NL.length = null; $('nl-length').value = ''; S.boundaries = []; BD.ext = null; BD.groups = null; renderBoundaryList();
+    setPickMode(false); setNormalMode(false); NL.length = null; $('nl-length').value = ''; S.boundaries = []; BD.ext = null; BD.groups = null; resetForceWindow(); renderBoundaryList();
     S.meta = await api('open', { path });
     S.fieldCache.clear();
     await loadMesh();
@@ -1975,13 +2334,14 @@ async function openPath(path, opts = {}) {
 }
 
 // ----------------------------------------------------------------- sessions
-const SESSION_SUFFIX = '.semview.json';
+const SESSION_SUFFIX = '.semscope.json';
+const isSessionFile = p => p.endsWith(SESSION_SUFFIX) || p.endsWith('.semview.json');   // older files keep working
 
 function sessionState() {
   const [x0, y0] = screenToData(0, H()), [x1, y1] = screenToData(W(), 0);
   const p = $('line-panel');
   return {
-    semview_session: 1,
+    semscope_session: 1,
     saved: new Date().toISOString(),
     dataset: { path: S.meta.path, step: S.step },
     field: { name: S.field, cmap: S.cmap, invert: S.invert, range: { ...S.range } },
@@ -1992,11 +2352,12 @@ function sessionState() {
     normalLength: NL.length,
     normalSnap: NL.snap,
     activeLine: LP.active,
-    boundaries: BD.ext ? S.boundaries.map(b => ({ name: b.name, colorIdx: b.colorIdx, source: b.source, visible: b.visible, closed: !!b.closed, edges: b.edges.map(i => [BD.ext.ids[2 * i], BD.ext.ids[2 * i + 1]]) })) : [],
+    boundaries: BD.ext ? S.boundaries.map(b => ({ name: b.name, colorIdx: b.colorIdx, source: b.source, group: b.group, visible: b.visible, closed: !!b.closed, edges: b.edges.map(i => [BD.ext.ids[2 * i], BD.ext.ids[2 * i + 1]]) })) : [],
     boundaryAngle: BD.angle,
     showBoundaries: S.showBoundaries,
     chart: { open: !p.hidden, ...panelGeometry(p), grid: LP.showGrid, elem: LP.showElem, xview: LP.xview, yview: LP.yview },
     calc: { defs: calcDefs().map(d => ({ name: d.name, expr: d.expr })), open: CP.windowOpen, ...panelGeometry($('calc-panel')) },
+    forces: { open: FC.windowOpen, ...panelGeometry($('force-panel')), selection: [...FC.sel].map(id => (boundaryById(id) || {}).name).filter(Boolean), config: forceConfig(), plot: FC.plot, xview: FC.xview, yview: FC.yview },
   };
 }
 
@@ -2005,7 +2366,7 @@ const setVal = (id, v) => { const el = $(id); if (el && v !== undefined && v !==
 
 /** Apply a session; opens its dataset first when it differs from the current one. */
 async function applySession(sess) {
-  if (!sess || !sess.dataset) { toast('Not a semview session', true); return; }
+  if (!sess || !sess.dataset) { toast('Not a semscope session', true); return; }
   if (!S.meta || !S.meta.open || S.meta.path !== sess.dataset.path) {
     await openPath(sess.dataset.path, { quiet: true });
     if (!S.meta || S.meta.path !== sess.dataset.path) return;   // open failed (toast shown)
@@ -2063,11 +2424,22 @@ async function applySession(sess) {
         const b = newBoundary(sb.source || 'manual', sb.name);
         if (sb.colorIdx !== undefined) b.colorIdx = sb.colorIdx;
         b.visible = sb.visible !== false; b.closed = !!sb.closed;
+        if (sb.group !== undefined && sb.group !== null) b.group = sb.group;
         b.edges = (sb.edges || []).map(([e, sd]) => E.index.get(`${e}:${sd}`)).filter(i => i !== undefined);
       }
     } catch (err) { toast('Boundaries not restored: ' + err.message, true); }
   }
   renderBoundaryList();
+  // forces window: selection by boundary name, settings, geometry
+  const fo = sess.forces || {};
+  FC.result = null; FC.hover = null;
+  FC.sel = new Set(S.boundaries.filter(b => (fo.selection || []).includes(b.name)).map(b => b.id));
+  if (fo.config) applyForceConfig(fo.config);
+  if (fo.plot && FP_LABELS[fo.plot]) { FC.plot = fo.plot; setVal('fp-plot', fo.plot); }
+  FC.xview = fo.xview || null; FC.yview = fo.yview || null;
+  applyPanelGeometry($('force-panel'), fo);
+  renderForceBoundaries();
+  setForceWindow(fo.open === true);
   clearHistory();
   updateProbe();
   requestRender();
@@ -2109,7 +2481,7 @@ $('dlg-import').addEventListener('change', async ev => {
   if (!file) return;
   try {
     const sess = JSON.parse(await file.text());
-    if (!sess.semview_session) throw new Error(`${file.name} is not a semview session`);
+    if (!sess.semscope_session && !sess.semview_session) throw new Error(`${file.name} is not a semscope session`);
     closeDialog();
     await applySession(sess);
   } catch (err) { toast(err.message, true); }
@@ -2120,7 +2492,7 @@ async function loadSessionPath(path) {
   try {
     setPlaying(false);
     S.probePinned = null; clearLines(false); clearHistory();
-    setPickMode(false); setNormalMode(false); S.boundaries = []; BD.groups = null; renderBoundaryList();
+    setPickMode(false); setNormalMode(false); S.boundaries = []; BD.groups = null; resetForceWindow(); renderBoundaryList();
     const meta = await api('session/load', { path });
     if (!(S.meta && S.meta.open && S.meta.path === meta.path)) BD.ext = null;
     const sameDataset = S.meta && S.meta.open && S.meta.path === meta.path;
@@ -2135,7 +2507,7 @@ function toggleSidebar() { $('app').classList.toggle('no-sidebar'); requestRende
 const SHORTCUTS = [
   ['wheel / drag', 'zoom / pan'], ['double-click', 'reset view'], ['right-click', 'context menu'],
   ['hover / click', 'probe / pin probe'], ['Shift-drag or l', 'line probe'], ['w', 'wall-normal line'],
-  ['Ctrl while dragging', 'snap line angle to 10°'], ['Del', 'delete selected line'], ['g', 'line chart window'], ['k', 'field calculator window'],
+  ['Ctrl while dragging', 'snap line angle to 10°'], ['Del', 'delete selected line'], ['g', 'line chart window'], ['k', 'field calculator window'], ['f', 'forces window'],
   ['b', 'sidebar'], ['Space, ← →, Home, End', 'time steps'], ['1 / 2', 'spectral / nodal rendering'],
   ['m, c, n', 'element edges, iso-lines, GLL nodes'], ['r', 'reset view'], ['s', 'screenshot'],
   ['o', 'open dataset or session'], ['Ctrl+S', 'save session'], ['Ctrl+Z / Ctrl+Shift+Z', 'undo / redo'], ['Esc', 'leave a mode / unpin probe'],
@@ -2165,6 +2537,7 @@ function menuItems(name) {
     '-',
     { label: 'Line chart window', key: 'g', checked: LP.windowOpen, action: () => setLineWindow(!LP.windowOpen) },
     { label: 'Field calculator window', key: 'k', checked: CP.windowOpen, action: () => setCalcWindow(!CP.windowOpen) },
+    { label: 'Forces window', key: 'f', checked: FC.windowOpen, action: () => setForceWindow(!FC.windowOpen) },
     { label: 'Sidebar', key: 'b', checked: !$('app').classList.contains('no-sidebar'), action: toggleSidebar },
     '-',
     { label: 'Axes', checked: S.axes, action: () => $('show-axes').click() },
@@ -2181,7 +2554,7 @@ function menuItems(name) {
   ];
   return [
     { label: 'Keyboard and mouse…', action: showHelp },
-    { label: 'About semview', action: () => toast('semview — spectral-element-aware viewer for 2D CG SEM data (Nek5000 / Neko), built on pySEMTools') },
+    { label: 'About semscope', action: () => toast('semscope — spectral-element-aware viewer for 2D CG SEM data (Nek5000 / Neko), built on pySEMTools') },
   ];
 }
 function openMenu(btn) {
@@ -2207,7 +2580,7 @@ function toast(msg, error = false) {
 }
 
 // ----------------------------------------------------------------- boot
-window.semview = { S, R, BD, NL, CP, setCalcWindow, defineField, removeCalcField, syncCalcDefs, boundaryNodeAt, boundaryPointAt, edgePoint, createNormalLine, setNormalMode, api, requestRender, pythonSnippet, lineCSV, sessionState, applySession, detectBoundaries, setPickMode, toggleEdge, edgeAt };   // handy for debugging / scripting the GUI
+window.semscope = { S, R, BD, NL, CP, FC, setForceWindow, computeForces, forceConfig, applyForceConfig, setCalcWindow, defineField, removeCalcField, syncCalcDefs, boundaryNodeAt, boundaryPointAt, edgePoint, createNormalLine, setNormalMode, api, requestRender, pythonSnippet, lineCSV, sessionState, applySession, detectBoundaries, setPickMode, toggleEdge, edgeAt };   // handy for debugging / scripting the GUI
 (async () => {
   try {
     resize();

@@ -6,9 +6,9 @@ import pytest
 matplotlib = pytest.importorskip("matplotlib")
 matplotlib.use("Agg")
 
-import semview  # noqa: E402
-from semview import synthetic  # noqa: E402
-from semview.plotting import Plotter, quick_plot  # noqa: E402
+import semscope  # noqa: E402
+from semscope import synthetic  # noqa: E402
+from semscope.plotting import Plotter, quick_plot  # noqa: E402
 
 
 @pytest.fixture
@@ -63,7 +63,7 @@ def test_quick_plot_and_log(tmp_path, data):
 
 
 def test_cli_info_and_png(tmp_path, data, capsys):
-    from semview.cli import main
+    from semscope.cli import main
 
     path = str(tmp_path / "tg0.f00000")
     data.write(path)

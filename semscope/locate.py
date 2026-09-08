@@ -2,7 +2,7 @@
 
 Given physical points ``(x, y)`` find the element that contains each one and
 its reference coordinates ``(r, s)``, by inverting the (polynomial) geometry
-map of the element with Newton's method.  This is what allows semview to
+map of the element with Newton's method.  This is what allows semscope to
 evaluate a field at an arbitrary point exactly, instead of interpolating
 linearly between GLL nodes.
 

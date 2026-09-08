@@ -7,14 +7,14 @@ from http.server import ThreadingHTTPServer
 import numpy as np
 import pytest
 
-from semview import synthetic
-from semview.gui.server import DataService, browse, make_handler
-from semview.session import load_session, plotter_from_session, save_session
+from semscope import synthetic
+from semscope.gui.server import DataService, browse, make_handler
+from semscope.session import load_session, plotter_from_session, save_session
 
 
 def _session(path, **over):
     sess = {
-        "semview_session": 1,
+        "semscope_session": 1,
         "dataset": {"path": path, "step": 0},
         "field": {"name": "vort", "cmap": "RdBu", "invert": True, "range": {"auto": False, "sym": True, "lo": -4.0, "hi": 4.0}},
         "calc": {"defs": [{"name": "vort", "expr": "dx(v) - dy(u)"}], "open": True},
@@ -39,13 +39,13 @@ def dataset_file(tmp_path_factory):
 
 def test_save_load_roundtrip(tmp_path, dataset_file):
     out = save_session(str(tmp_path / "my"), _session(dataset_file))
-    assert out.endswith(".semview.json") and os.path.exists(out)
+    assert out.endswith(".semscope.json") and os.path.exists(out)
     back = load_session(out)
     assert back["dataset"]["path"] == dataset_file
     assert back["field"]["name"] == "vort" and "saved" in back
     # relative dataset paths are resolved against the session file location
     rel = _session(os.path.basename(dataset_file))
-    p2 = save_session(str(tmp_path / "rel.semview.json"), rel)
+    p2 = save_session(str(tmp_path / "rel.semscope.json"), rel)
     back2 = load_session(p2)
     assert back2["dataset"]["path"] == str(tmp_path / os.path.basename(dataset_file))
     with pytest.raises(FileExistsError):
@@ -59,7 +59,7 @@ def test_save_load_roundtrip(tmp_path, dataset_file):
 def test_plotter_from_session(tmp_path, dataset_file):
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg")
-    path = save_session(str(tmp_path / "fig.semview.json"), _session(dataset_file))
+    path = save_session(str(tmp_path / "fig.semscope.json"), _session(dataset_file))
     pl, data = plotter_from_session(path, figsize=(4, 4), dpi=60)
     kinds = [L.kind for L in pl._layers]
     assert kinds == ["field", "contours", "mesh", "segments", "points"]
@@ -75,9 +75,9 @@ def test_plotter_from_session(tmp_path, dataset_file):
 
 def test_cli_png_from_session(tmp_path, dataset_file):
     pytest.importorskip("matplotlib")
-    from semview.cli import main
+    from semscope.cli import main
 
-    path = save_session(str(tmp_path / "cli.semview.json"), _session(dataset_file))
+    path = save_session(str(tmp_path / "cli.semscope.json"), _session(dataset_file))
     out = str(tmp_path / "cli.png")
     assert main(["--png", out, path]) == 0
     assert os.path.getsize(out) > 1000
@@ -110,7 +110,7 @@ def _post(url, body):
 
 def test_server_session_endpoints(server, tmp_path, dataset_file):
     base, service = server
-    target = str(tmp_path / "srv.semview.json")
+    target = str(tmp_path / "srv.semscope.json")
     status, out = _post(f"{base}/api/session/save?path={target}", _session(dataset_file))
     assert status == 200 and out["ok"] and os.path.exists(target)
     status, out = _post(f"{base}/api/session/save?path={target}", _session(dataset_file))
@@ -120,8 +120,24 @@ def test_server_session_endpoints(server, tmp_path, dataset_file):
     st = _get(f"{base}/api/session/load?path={target}")
     assert st["open"] and st["path"] == dataset_file
     assert st["session"]["activeLine"] == 2 and st["session"]["dataset"]["path"] == dataset_file
-    assert any(e["type"] == "session" and e["name"] == "srv.semview.json" for e in browse(str(tmp_path))["entries"])
+    assert any(e["type"] == "session" and e["name"] == "srv.semscope.json" for e in browse(str(tmp_path))["entries"])
     # state keeps handing out the session until another dataset is opened
     assert _get(f"{base}/api/state")["session"]["activeLine"] == 2
     st = _get(f"{base}/api/open?path={dataset_file}")
     assert st["session"] is None
+
+
+def test_legacy_semview_session_files_still_load(tmp_path, dataset_file):
+    """Sessions written before the rename (.semview.json, key semview_session) keep working."""
+    sess = _session(dataset_file)
+    sess["semview_session"] = sess.pop("semscope_session")
+    old = tmp_path / "old.semview.json"
+    old.write_text(json.dumps(sess))
+    back = load_session(str(old))
+    assert back["semscope_session"] == 1 and "semview_session" not in back
+    assert back["dataset"]["path"] == dataset_file
+    assert save_session(str(tmp_path / "again"), back).endswith(".semscope.json")
+    assert any(e["type"] == "session" and e["name"] == "old.semview.json" for e in browse(str(tmp_path))["entries"])
+    service = DataService()
+    st = service.open(str(old))
+    assert st["open"] and st["session"]["semscope_session"] == 1

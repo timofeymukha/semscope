@@ -1,4 +1,4 @@
-"""HTTP server for the semview GUI.
+"""HTTP server for the semscope GUI.
 
 Pure standard library: a ``ThreadingHTTPServer`` serves the static front-end
 and a small JSON/binary API.  Field data goes to the browser as raw little-
@@ -30,7 +30,8 @@ from .. import spectral as sp
 from ..boundary import detect_boundaries, edge_nodes, edge_normals
 from ..calc import ExpressionError, syntax_help
 from ..dataset import Dataset, SEMData2D
-from ..session import SESSION_SUFFIX, load_session, save_session
+from ..forces import compute_forces, sum_forces
+from ..session import SESSION_SUFFIXES, is_session_file, load_session, save_session
 
 __all__ = ["serve", "DataService", "worker_loop"]
 
@@ -79,7 +80,7 @@ class DataService:
             self.comm.bcast(cmd, root=0)
 
     def open(self, path: str, session: dict | None = None):
-        if path.endswith(SESSION_SUFFIX):
+        if is_session_file(path):
             return self.open_session(path)
         with self.lock:
             if os.path.abspath(path) != (os.path.abspath(self.path) if self.path else None):
@@ -240,6 +241,39 @@ class DataService:
             "groups": [{"name": g.name, "closed": g.closed, "edges": [b["index"][(int(e), int(s_))] for e, s_ in g.edges]} for g in groups],
         }
 
+    def forces(self, body: dict) -> dict:
+        """Forces on the selected boundaries (edge indices into the external-edge list) for one step."""
+        step = int(body.get("step", 0))
+        d = self.get_step(step)
+        ext = self._external()["edges"]
+        kw = {k: body[k] for k in ("u", "v", "p") if body.get(k)}
+        kw["w"] = body.get("w") or None
+        for k in ("rho", "mu"):
+            if body.get(k) is not None and body.get(k) != "":
+                kw[k] = body[k]
+        for k in ("U_ref", "L_ref", "p_ref"):
+            if body.get(k) is not None and body.get(k) != "":
+                kw[k] = float(body[k])
+        if body.get("rho_ref") not in (None, ""):
+            kw["rho_ref"] = float(body["rho_ref"])
+        if body.get("axes"):
+            kw["axes"] = [(a["name"], a["dir"]) for a in body["axes"]]
+        results = []
+        for b in body.get("boundaries", []):
+            idx = np.asarray(b.get("edges", []), dtype=np.int64)
+            if idx.size == 0:
+                continue
+            if idx.min() < 0 or idx.max() >= len(ext):
+                raise ValueError(f"boundary {b.get('name', '')!r}: edge index out of range")
+            results.append(compute_forces(d, ext[idx], name=str(b.get("name", "")), **kw))
+        if not results:
+            raise ValueError("select at least one boundary with edges")
+        out = {"step": step, "time": d.time, "q": results[0].q, "rho_ref": results[0].rho_ref, "boundaries": [r.to_dict() for r in results]}
+        tot = sum_forces(results).to_dict()
+        tot.pop("dist", None)
+        out["total"] = tot
+        return out
+
     def probe(self, x: float, y: float, step: int, names: list[str]) -> dict:
         d = self.get_step(step)
         loc = d.locate([x], [y])
@@ -288,7 +322,7 @@ def browse(directory: str) -> dict:
         full = os.path.join(directory, nm)
         if os.path.isdir(full):
             entries.append({"name": nm, "type": "dir"})
-        elif nm.endswith(SESSION_SUFFIX):
+        elif nm.endswith(SESSION_SUFFIXES):
             entries.append({"name": nm, "type": "session", "size": os.path.getsize(full)})
         elif nm.endswith(".nek5000"):
             entries.append({"name": nm, "type": "meta", "size": os.path.getsize(full)})
@@ -301,10 +335,10 @@ def browse(directory: str) -> dict:
 # --------------------------------------------------------------------------- #
 def make_handler(service: DataService):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "semview/0.1"
+        server_version = "semscope/0.1"
 
         def log_message(self, fmt, *args):  # quieter log: API only
-            if os.environ.get("SEMVIEW_DEBUG"):
+            if os.environ.get("SEMSCOPE_DEBUG"):
                 sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
         # -------------------------------------------------------- helpers
@@ -364,6 +398,8 @@ def make_handler(service: DataService):
                     self._json(service.calc_define(str(body.get("name", "")), str(body.get("expr", "")), int(body.get("step", 0))))
                 elif url.path == "/api/calc/remove":
                     self._json(service.calc_remove(str(body.get("name", ""))))
+                elif url.path == "/api/forces":
+                    self._json(service.forces(body))
                 else:
                     raise FileNotFoundError(url.path)
             except FileNotFoundError as exc:
@@ -455,11 +491,11 @@ def serve(path: str | None = None, port: int = 8765, host: str = "127.0.0.1", op
         return None
     service = DataService(comm)
     if path:
-        service.open(path)   # a dataset or a *.semview.json session file
+        service.open(path)   # a dataset or a *.semscope.json session file
     httpd = ThreadingHTTPServer((host, port), make_handler(service))
     httpd.daemon_threads = True
     url = f"http://{host}:{httpd.server_address[1]}/"
-    print(f"semview GUI at {url}  (Ctrl-C to stop)", flush=True)
+    print(f"semscope GUI at {url}  (Ctrl-C to stop)", flush=True)
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     if not block:

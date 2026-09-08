@@ -1,8 +1,8 @@
 """File-format layer: Nek5000/Neko field files through pysemtools' MPI readers.
 
-Only this module (and :mod:`semview.mpi`) talk to pysemtools and mpi4py.  The
+Only this module (and :mod:`semscope.mpi`) talk to pysemtools and mpi4py.  The
 rest of the package works on plain numpy arrays held by
-:class:`semview.dataset.SEMData2D`.
+:class:`semscope.dataset.SEMData2D`.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-os.environ.setdefault("PYSEMTOOLS_HIDE_LOG", "true")  # also set in semview/__init__.py
+os.environ.setdefault("PYSEMTOOLS_HIDE_LOG", "true")  # also set in semscope/__init__.py
 
 __all__ = ["Nek5000Series", "read_header", "resolve_files", "read_step"]
 
@@ -185,7 +185,7 @@ def read_step(path: str, comm=None, dtype=np.float64, mesh=None):
     hdr = read_header(path)
     if hdr.orders[2] > 1:
         raise ValueError(
-            f"{path}: this is a 3D file (lz={hdr.orders[2]}); semview handles 2D "
+            f"{path}: this is a 3D file (lz={hdr.orders[2]}); semscope handles 2D "
             "spectral-element data (lz == 1)."
         )
     msh = Mesh(comm, create_connectivity=False) if hdr.has_mesh else None

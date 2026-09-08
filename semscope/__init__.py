@@ -1,18 +1,18 @@
-"""semview — spectral-element-aware visualization of 2D CG SEM data.
+"""semscope — spectral-element-aware visualization of 2D CG SEM data.
 
 Two ways to use it:
 
 * **Scripting** (pyvista-like)::
 
-      import semview
-      data = semview.load("case0.nek5000", step=-1)
+      import semscope
+      data = semscope.load("case0.nek5000", step=-1)
       data.define("vort", "dx(v) - dy(u)")        # field calculator, spectrally exact derivatives
-      pl = semview.Plotter()
+      pl = semscope.Plotter()
       pl.add_field(data, "vort", cmap="RdBu_r", clim=(-5, 5))
       pl.add_mesh(data)
       pl.save("vorticity.png")
 
-* **GUI**: ``semview case0.nek5000`` (or ``semview.serve(...)``) opens a
+* **GUI**: ``semscope case0.nek5000`` (or ``semscope.serve(...)``) opens a
   WebGL viewer in the browser that evaluates the spectral basis on the GPU.
 """
 
@@ -34,7 +34,7 @@ __version__ = "0.1.0"
 
 
 def __getattr__(name):
-    # Lazy imports keep `import semview` light (no matplotlib / web server).
+    # Lazy imports keep `import semscope` light (no matplotlib / web server).
     if name == "Plotter":
         from .plotting import Plotter
 

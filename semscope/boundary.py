@@ -13,6 +13,15 @@ Edge sides are numbered counter-clockwise around the element::
     side 1: r = +1 (i = n - 1),  j increasing   (right)
     side 2: s = +1 (j = n - 1),  i decreasing   (top)
     side 3: r = -1 (i = 0),      j decreasing   (left)
+
+That order runs counter-clockwise only for elements with a positive Jacobian.
+Meshes routinely contain *mirrored* elements (negative Jacobian, e.g. from a
+mirrored half mesh), whose sides run clockwise.  Everything that walks along
+the boundary therefore works on *oriented* edges (:func:`orient_rows`): the
+node order of mirrored elements is reversed so that every edge runs with the
+fluid on its left.  The per-edge functions (:func:`edge_nodes`,
+:func:`edge_normals`, :func:`edge_point`, :func:`normal_line`) keep the plain
+index order of the side.
 """
 
 from __future__ import annotations
@@ -23,7 +32,7 @@ import numpy as np
 
 from . import spectral as sp
 
-__all__ = ["Boundary", "external_edges", "edge_nodes", "edge_normals", "edge_point", "normal_line", "normal_line_at", "chain_edges", "detect_boundaries", "SIDE_NAMES"]
+__all__ = ["Boundary", "external_edges", "edge_nodes", "edge_normals", "edge_point", "normal_line", "normal_line_at", "chain_edges", "detect_boundaries", "match_tolerance", "orient_rows", "SIDE_NAMES"]
 
 SIDE_NAMES = ("bottom", "right", "top", "left")
 
@@ -59,37 +68,74 @@ def _all_edges(x: np.ndarray, y: np.ndarray):
     return elem, side, xe, ye
 
 
-def _tolerance(xe, ye):
-    chord = np.hypot(xe[:, -1] - xe[:, 0], ye[:, -1] - ye[:, 0])
-    return 1e-4 * max(float(np.median(chord)), 1e-300)
+def _chords(xe, ye):
+    return np.hypot(xe[:, -1] - xe[:, 0], ye[:, -1] - ye[:, 0])
+
+
+def match_tolerance(chord_a, chord_b, magnitude, rel: float = 1e-3, floor: float = 1e-6, cap: float = 0.2):
+    """Distance within which two vertices count as the same mesh point.
+
+    Relative to the smaller of the two edge chords, with a floor proportional to
+    the coordinate magnitude that absorbs the rounding of single-precision
+    coordinates (a shared vertex written per element in ``float32`` can differ
+    by about 1e-7 of its magnitude between the two copies), and capped at a
+    fraction of the chord so that distinct vertices of a small element are never
+    merged.  Meshes mix tiny wall elements with large far-field ones, so no
+    single absolute tolerance works.
+    """
+    small = np.minimum(chord_a, chord_b)
+    return np.minimum(cap * small, np.maximum(rel * small, floor * (1.0 + magnitude)))
+
+
+def _nearest_matches(points, query, chord_p, chord_q, tol, k=4):
+    """For each query point the candidate ``points`` (k nearest) within the pair tolerance.
+
+    Returns ``(cand, ok, dist)`` arrays of shape ``(nq, k)``; invalid columns are
+    marked False in ``ok``.
+    """
+    from scipy.spatial import cKDTree
+
+    n = len(points)
+    k = max(1, min(k, n))
+    dist, cand = cKDTree(points).query(query, k=k)
+    dist = np.asarray(dist).reshape(len(query), k)
+    cand = np.asarray(cand).reshape(len(query), k)
+    valid = cand < n
+    cand = np.where(valid, cand, 0)
+    if tol is None:
+        mag = np.linalg.norm(query, axis=1)[:, None]
+        tau = match_tolerance(chord_q[:, None], chord_p[cand], mag)
+    else:
+        tau = float(tol)
+    return cand, valid & (dist <= tau), dist
 
 
 def external_edges(x: np.ndarray, y: np.ndarray, tol: float | None = None) -> np.ndarray:
     """Edges not shared with another element, as ``(nb, 2)`` array of ``(elem, side)``.
 
-    Two edges are the same edge when both end points coincide within ``tol``
-    (default: 1e-4 of the median edge chord).  The result is sorted by
-    ``(elem, side)``, so indices into it are stable.
+    Two edges are the same edge when both end points coincide within the
+    tolerance of :func:`match_tolerance` (or the absolute ``tol`` if given).
+    The result is sorted by ``(elem, side)``, so indices into it are stable.
     """
-    from scipy.spatial import cKDTree
-
     elem, side, xe, ye = _all_edges(x, y)
-    if tol is None:
-        tol = _tolerance(xe, ye)
     mid = np.stack([0.5 * (xe[:, 0] + xe[:, -1]), 0.5 * (ye[:, 0] + ye[:, -1])], axis=1)
-    tree = cKDTree(mid)
-    pairs = tree.query_pairs(r=tol, output_type="ndarray")
+    chord = _chords(xe, ye)
+    cand, ok, _ = _nearest_matches(mid, mid, chord, chord, tol)
+    a = np.arange(elem.size)
     matched = np.zeros(elem.size, dtype=bool)
-    if pairs.size:
-        a, b = pairs[:, 0], pairs[:, 1]
-        pa0 = np.stack([xe[a, 0], ye[a, 0]], 1)
-        pa1 = np.stack([xe[a, -1], ye[a, -1]], 1)
-        pb0 = np.stack([xe[b, 0], ye[b, 0]], 1)
-        pb1 = np.stack([xe[b, -1], ye[b, -1]], 1)
-        same = (np.linalg.norm(pa0 - pb1, axis=1) < tol) & (np.linalg.norm(pa1 - pb0, axis=1) < tol)
-        same |= (np.linalg.norm(pa0 - pb0, axis=1) < tol) & (np.linalg.norm(pa1 - pb1, axis=1) < tol)
-        matched[a[same]] = True
-        matched[b[same]] = True
+    p0 = np.stack([xe[:, 0], ye[:, 0]], 1)
+    p1 = np.stack([xe[:, -1], ye[:, -1]], 1)
+    for j in range(cand.shape[1]):
+        b = cand[:, j]
+        use = ok[:, j] & (b != a)
+        if not use.any():
+            continue
+        tau = match_tolerance(chord, chord[b], np.linalg.norm(mid, axis=1)) if tol is None else float(tol)
+        same = (np.linalg.norm(p0 - p1[b], axis=1) <= tau) & (np.linalg.norm(p1 - p0[b], axis=1) <= tau)
+        same |= (np.linalg.norm(p0 - p0[b], axis=1) <= tau) & (np.linalg.norm(p1 - p1[b], axis=1) <= tau)
+        hit = use & same
+        matched[a[hit]] = True
+        matched[b[hit]] = True
     ext = ~matched
     return np.stack([elem[ext], side[ext]], axis=1)
 
@@ -101,6 +147,21 @@ def jacobian_sign(x: np.ndarray, y: np.ndarray, elems) -> np.ndarray:
     yr, ys = sp.element_derivatives(y[elems])
     det = (xr * ys - xs * yr).mean(axis=(1, 2))
     return np.where(det < 0, -1.0, 1.0)
+
+
+def orient_rows(arr: np.ndarray, sign) -> np.ndarray:
+    """Reverse the node order (axis 1) of the rows belonging to mirrored elements.
+
+    ``arr`` is ``(k, n)`` or ``(k, n, ...)`` per-edge data in side index order and
+    ``sign`` the Jacobian sign of each edge's element; afterwards every edge runs
+    with the domain on its left.
+    """
+    arr = np.asarray(arr)
+    out = arr.copy()
+    m = np.asarray(sign) < 0
+    if m.any():
+        out[m] = arr[m][:, ::-1]
+    return out
 
 
 def edge_normals(x: np.ndarray, y: np.ndarray, edges: np.ndarray) -> np.ndarray:
@@ -180,24 +241,24 @@ def chain_edges(x: np.ndarray, y: np.ndarray, edges: np.ndarray, tol: float | No
     """Order external edges into loops.
 
     Returns a list of ``(indices, closed)`` where ``indices`` index into
-    ``edges`` in traversal order (the end of one edge is the start of the next).
+    ``edges`` in traversal order (the end of one edge is the start of the next,
+    with the domain on the left; mirrored elements are handled).
     """
-    from scipy.spatial import cKDTree
-
+    sgn = jacobian_sign(x, y, edges[:, 0])
     xe, ye = edge_nodes(x, y, edges[:, 0], edges[:, 1])
-    if tol is None:
-        tol = _tolerance(xe, ye)
+    xe, ye = orient_rows(xe, sgn), orient_rows(ye, sgn)
     starts = np.stack([xe[:, 0], ye[:, 0]], 1)
     ends = np.stack([xe[:, -1], ye[:, -1]], 1)
     t0, t1 = _tangents(xe, ye)
-    tree = cKDTree(starts)
-    cand = tree.query_ball_point(ends, r=tol)
+    chord = _chords(xe, ye)
+    cand, ok, _ = _nearest_matches(starts, ends, chord, chord, tol)
+    ok &= cand != np.arange(len(edges))[:, None]
     nxt = np.full(len(edges), -1)
-    for i, c in enumerate(cand):
-        c = [j for j in c if j != i]
+    for i in np.nonzero(ok.any(axis=1))[0]:
+        c = cand[i, ok[i]]
         if len(c) == 1:
             nxt[i] = c[0]
-        elif len(c) > 1:  # non-manifold vertex: continue as straight as possible
+        else:  # non-manifold vertex: continue as straight as possible
             nxt[i] = min(c, key=lambda j: _turn_deg(t1[i], t0[j]))
     has_prev = np.zeros(len(edges), dtype=bool)
     has_prev[nxt[nxt >= 0]] = True
@@ -240,9 +301,20 @@ class Boundary:
     def n(self) -> int:
         return self.x.shape[-1]
 
+    @property
+    def orientation(self) -> np.ndarray:
+        """Jacobian sign of each edge's element (``-1`` for mirrored elements)."""
+        if getattr(self, "_orientation", None) is None or len(self._orientation) != len(self.edges):
+            self._orientation = jacobian_sign(self.x, self.y, self.edges[:, 0]) if len(self.edges) else np.zeros(0)
+        return self._orientation
+
+    def _oriented(self, arr):
+        return orient_rows(arr, self.orientation)
+
     def nodes(self) -> tuple[np.ndarray, np.ndarray]:
-        """GLL node coordinates along the edges, ``(k, n)`` each."""
-        return edge_nodes(self.x, self.y, self.edges[:, 0], self.edges[:, 1])
+        """GLL node coordinates along the edges, ``(k, n)`` each, in traversal order (domain on the left)."""
+        xe, ye = edge_nodes(self.x, self.y, self.edges[:, 0], self.edges[:, 1])
+        return self._oriented(xe), self._oriented(ye)
 
     def coords(self, m: int | None = None) -> np.ndarray:
         """Points along the boundary, spectrally resampled to ``m`` per edge: ``(k, m, 2)``."""
@@ -272,20 +344,24 @@ class Boundary:
         return float(np.sum(speed * w))
 
     def values(self, data_or_field) -> np.ndarray:
-        """Nodal values ``(k, n)`` of a field along the boundary edges."""
+        """Nodal values ``(k, n)`` of a field along the boundary edges, in the order of :meth:`nodes`."""
         f = np.asarray(data_or_field)
-        return edge_nodes(f, f, self.edges[:, 0], self.edges[:, 1])[0]
+        return self._oriented(edge_nodes(f, f, self.edges[:, 0], self.edges[:, 1])[0])
 
     def normals(self) -> np.ndarray:
-        """Outward unit normals ``(k, n, 2)`` at the boundary GLL nodes."""
-        return edge_normals(self.x, self.y, self.edges)
+        """Outward unit normals ``(k, n, 2)`` at the boundary GLL nodes, in the order of :meth:`nodes`."""
+        return self._oriented(edge_normals(self.x, self.y, self.edges))
+
+    def _side_index(self, k: int, node: int) -> int:
+        return int(node) if self.orientation[k] > 0 else self.n - 1 - int(node)
 
     def normal_line(self, k: int, node: int, length: float):
-        """Wall-normal segment ``(p0, p1)`` from node ``node`` of the ``k``-th edge, ``length`` into the domain."""
-        return normal_line(self.x, self.y, int(self.edges[k, 0]), int(self.edges[k, 1]), node, length)
+        """Wall-normal segment ``(p0, p1)`` from node ``node`` (traversal order) of the ``k``-th edge, ``length`` into the domain."""
+        return normal_line(self.x, self.y, int(self.edges[k, 0]), int(self.edges[k, 1]), self._side_index(k, node), length)
 
     def normal_line_at(self, k: int, t: float, length: float):
-        """Wall-normal segment from the point at edge parameter ``t`` (``-1..1``) of the ``k``-th edge."""
+        """Wall-normal segment from the point at parameter ``t`` (``-1..1``, traversal order) of the ``k``-th edge."""
+        t = float(t) if self.orientation[k] > 0 else -float(t)
         return normal_line_at(self.x, self.y, int(self.edges[k, 0]), int(self.edges[k, 1]), t, length)
 
     def to_dict(self) -> dict:
@@ -303,8 +379,9 @@ def detect_boundaries(x: np.ndarray, y: np.ndarray, angle: float = 90.0, edges: 
         edges = external_edges(x, y)
     if len(edges) == 0:
         return []
+    sgn = jacobian_sign(x, y, edges[:, 0])
     xe, ye = edge_nodes(x, y, edges[:, 0], edges[:, 1])
-    t0, t1 = _tangents(xe, ye)
+    t0, t1 = _tangents(orient_rows(xe, sgn), orient_rows(ye, sgn))
     out = []
     for seq, closed in chain_edges(x, y, edges):
         k = len(seq)

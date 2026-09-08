@@ -1,4 +1,4 @@
-"""Command line entry point: ``semview [options] [FILE]``."""
+"""Command line entry point: ``semscope [options] [FILE]``."""
 
 from __future__ import annotations
 
@@ -8,11 +8,11 @@ import sys
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
-        prog="semview",
+        prog="semscope",
         description="Spectral-element-aware viewer for 2D Nek5000/Neko field files. "
         "Opens a browser GUI; run under mpirun to read large files in parallel.",
     )
-    p.add_argument("file", nargs="?", help=".nek5000 metafile, a case0.f00000 field file, a glob, or a saved *.semview.json session")
+    p.add_argument("file", nargs="?", help=".nek5000 metafile, a case0.f00000 field file, a glob, or a saved *.semscope.json session")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--no-browser", action="store_true", help="do not open a browser window")
@@ -27,10 +27,10 @@ def main(argv=None) -> int:
     if args.info or args.png:
         if not args.file:
             p.error("a FILE is required")
-        import semview
+        import semscope
 
-        if args.png and args.file.endswith(".semview.json"):
-            from semview.session import plotter_from_session
+        if args.png and args.file.endswith((".semscope.json", ".semview.json")):
+            from semscope.session import plotter_from_session
 
             pl, data = plotter_from_session(args.file)
             if pl is None:  # non-root MPI rank
@@ -38,11 +38,11 @@ def main(argv=None) -> int:
             pl.save(args.png)
             print(f"wrote {args.png} from session {args.file}")
             return 0
-        if args.file.endswith(".semview.json"):
-            from semview.session import load_session
+        if args.file.endswith((".semscope.json", ".semview.json")):
+            from semscope.session import load_session
 
             args.file = load_session(args.file)["dataset"]["path"]
-        ds = semview.open(args.file)
+        ds = semscope.open(args.file)
         data = ds[args.step].gather(ds.comm)
         if data is None:  # non-root MPI rank
             return 0
@@ -57,7 +57,7 @@ def main(argv=None) -> int:
                 a = data[nm]
                 print(f"    {nm:10s} min {a.min(): .6g}  max {a.max(): .6g}")
             return 0
-        from semview.plotting import Plotter
+        from semscope.plotting import Plotter
 
         name = args.field or data.field_names[0]
         pl = Plotter()
@@ -69,7 +69,7 @@ def main(argv=None) -> int:
         print(f"wrote {args.png}")
         return 0
 
-    from semview.gui.server import serve
+    from semscope.gui.server import serve
 
     serve(args.file, port=args.port, host=args.host, open_browser=not args.no_browser)
     return 0

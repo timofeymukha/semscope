@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>semview</title>
+<title>semscope</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -18,7 +18,7 @@
   </header>
   <aside id="sidebar">
     <header id="brand">
-      <div class="logo"><span class="logo-mark"></span>semview</div>
+      <div class="logo"><span class="logo-mark"></span>semscope</div>
       <div class="tagline">spectral-element viewer</div>
     </header>
 
@@ -27,7 +27,7 @@
       <div class="row">
         <button id="btn-open" class="btn primary" title="Open a .nek5000 metafile, a field file or a saved session (O)">Open…</button>
         <button id="btn-reload" class="btn" title="Re-read the current dataset">Reload</button>
-        <button id="btn-save-session" class="btn" title="Save dataset, field, rendering options, view, probes and lines as a *.semview.json session (Ctrl+S)">Save session…</button>
+        <button id="btn-save-session" class="btn" title="Save dataset, field, rendering options, view, probes and lines as a *.semscope.json session (Ctrl+S)">Save session…</button>
       </div>
       <div id="file-info" class="info muted">No dataset loaded</div>
       <div id="time-block" hidden>
@@ -126,6 +126,7 @@
         <button id="bd-new" class="btn small" title="Define a boundary by clicking external edges on the plot; double-click adds a whole run up to the corners">New manual…</button>
         <button id="bd-done" class="btn small primary" hidden title="Finish picking edges (Esc)">Done</button>
         <label class="check"><input type="checkbox" id="bd-show" checked> show</label>
+        <button id="bd-forces" class="btn small" title="Forces and force coefficients on selected boundaries (f)">Forces…</button>
       </div>
       <div id="bd-list" class="bd-list"></div>
     </section>
@@ -135,7 +136,7 @@
         <button id="btn-reset" class="btn" title="Reset view (Home / double-click)">Reset view</button>
         <button id="btn-shot" class="btn" title="Save a PNG of the current view (S)">Screenshot</button>
       </div>
-      <div class="keys muted">wheel: zoom · drag: pan · right-click: menu · Ctrl+Z / Ctrl+Shift+Z: undo / redo · Ctrl+S: save session · space: play · ←/→: step · m: edges · c: iso-lines · n: nodes · l: line probe · w: wall-normal line · Del: remove line · g: line chart window · k: field calculator</div>
+      <div class="keys muted">wheel: zoom · drag: pan · right-click: menu · Ctrl+Z / Ctrl+Shift+Z: undo / redo · Ctrl+S: save session · space: play · ←/→: step · m: edges · c: iso-lines · n: nodes · l: line probe · w: wall-normal line · Del: remove line · g: line chart window · k: field calculator · f: forces</div>
     </section>
   </aside>
 
@@ -178,6 +179,51 @@
         <div id="cp-list" class="cp-list"></div>
       </div>
     </div>
+    <div id="force-panel" class="tool-panel" hidden>
+      <div class="lp-head" id="fp-head">
+        <span id="fp-title" class="mono grow" title="drag to move the panel">forces</span>
+        <span id="fp-info" class="mono muted"></span>
+        <button id="fp-copy" class="btn icon" title="Copy the force table (tab-separated)">⎘</button>
+        <button id="fp-reset" class="btn icon" title="Reset the chart zoom (double-click on the chart)">⟲</button>
+        <button id="fp-close" class="btn icon" title="Close (f) — the settings are kept">✕</button>
+      </div>
+      <div class="fp-body">
+        <div class="fp-grid" id="fp-grid">
+          <div class="fp-row"><span class="cp-label">boundaries</span><div id="fp-bd" class="fp-bd"></div></div>
+          <div class="fp-row"><span class="cp-label">fields</span>
+            <label>u</label><select id="fp-u" class="fp-sel" title="velocity component along x"></select>
+            <label>v</label><select id="fp-v" class="fp-sel" title="velocity component along y"></select>
+            <label>w</label><select id="fp-w" class="fp-sel" title="optional spanwise velocity: adds the z force from its wall-normal gradient"></select>
+            <label>p</label><select id="fp-p" class="fp-sel" title="pressure"></select>
+          </div>
+          <div class="fp-row"><span class="cp-label">material</span>
+            <label title="density: only enters the reference dynamic pressure q = ½ρU² (the pressure field is used as stored)">ρ</label><select id="fp-rho-mode" class="fp-sel"></select><input type="text" id="fp-rho" class="mono fp-num" value="1" title="constant density">
+            <label title="dynamic viscosity in the wall stress μ(∇u + ∇uᵀ)·n">μ</label><select id="fp-mu-mode" class="fp-sel"></select><input type="text" id="fp-mu" class="mono fp-num" value="1" title="constant viscosity">
+          </div>
+          <div class="fp-row"><span class="cp-label">reference</span>
+            <label>U</label><input type="text" id="fp-U" class="mono fp-num" value="1" title="reference velocity">
+            <label>L</label><input type="text" id="fp-L" class="mono fp-num" value="1" title="reference length (forces are per unit depth)">
+            <label>p<sub>ref</sub></label><input type="text" id="fp-pref" class="mono fp-num" value="0" title="reference pressure of Cp = (p − p_ref) / q">
+            <label>ρ<sub>ref</sub></label><input type="text" id="fp-rhoref" class="mono fp-num" placeholder="auto" title="reference density of q = ½ρU²; empty: the material density (its boundary average when it is a field)">
+          </div>
+          <div class="fp-row"><span class="cp-label">axes</span>
+            <input type="text" id="fp-a1" class="mono fp-name" value="x" title="name of the first projection axis; its coefficient is C followed by the name"> = (<input type="text" id="fp-a1x" class="mono fp-num" value="1">, <input type="text" id="fp-a1y" class="mono fp-num" value="0">)
+            <input type="text" id="fp-a2" class="mono fp-name" value="y" title="name of the second projection axis"> = (<input type="text" id="fp-a2x" class="mono fp-num" value="0">, <input type="text" id="fp-a2y" class="mono fp-num" value="1">)
+            <label title="rotate both axes: axis 1 = (cos α, sin α), axis 2 = (−sin α, cos α)">α</label><input type="text" id="fp-alpha" class="mono fp-num" value="0">°
+          </div>
+        </div>
+        <div id="fp-status" class="cp-status mono muted"></div>
+        <table id="fp-table" class="fp-table mono"></table>
+        <div class="fp-chart-head">
+          <label>along the wall</label>
+          <select id="fp-plot" class="fp-sel" title="quantity plotted against the arc length of each selected boundary">
+            <option value="cp">Cp = (p − p_ref) / q</option><option value="cf">Cf = τw / q</option><option value="p">p</option><option value="tau">τw</option>
+          </select>
+          <span id="fp-hover" class="mono muted grow"></span>
+        </div>
+        <div class="fp-chart"><canvas id="fp-canvas" title="hover: values and position on the plot · wheel: zoom arc length · shift+wheel: zoom value · drag: pan · double-click: reset · right-click: export"></canvas></div>
+      </div>
+    </div>
   </main>
 </div>
 
@@ -203,7 +249,7 @@
     </div>
     <ul id="dlg-list" class="filelist"></ul>
     <div class="modal-foot muted row space">
-      <span>Select a <b>.nek5000</b> metafile (time series), a single <b>case0.f00000</b> field file, or a saved <b>.semview.json</b> session.</span>
+      <span>Select a <b>.nek5000</b> metafile (time series), a single <b>case0.f00000</b> field file, or a saved <b>.semscope.json</b> session.</span>
       <label class="btn small" title="Load a session file from your computer (its dataset must be reachable by the server)">Import session… <input type="file" id="dlg-import" accept=".json,application/json" hidden></label>
     </div>
   </div>
@@ -216,11 +262,11 @@
       <button id="sdlg-close" class="btn icon">✕</button>
     </div>
     <div class="row">
-      <input type="text" id="sdlg-path" class="mono grow" placeholder="/path/to/case.semview.json">
+      <input type="text" id="sdlg-path" class="mono grow" placeholder="/path/to/case.semscope.json">
       <button id="sdlg-save" class="btn primary">Save</button>
       <button id="sdlg-download" class="btn" title="Download the session file through the browser instead of writing it on the server">Download</button>
     </div>
-    <div class="modal-foot muted">Stores the dataset and step, field, colormap and range, rendering options, view, pinned probe, line probes, boundaries and calculator fields. Reopen it with <b>Open…</b>, with <b>semview file.semview.json</b>, or turn it into a figure with <b>semview --png out.png file.semview.json</b>.</div>
+    <div class="modal-foot muted">Stores the dataset and step, field, colormap and range, rendering options, view, pinned probe, line probes, boundaries, calculator fields and the force settings. Reopen it with <b>Open…</b>, with <b>semscope file.semscope.json</b>, or turn it into a figure with <b>semscope --png out.png file.semscope.json</b>.</div>
   </div>
 </div>
 

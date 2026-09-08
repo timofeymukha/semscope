@@ -1,11 +1,11 @@
 """GUI sessions: a JSON description of what the viewer shows.
 
-A session file (``*.semview.json``) records the dataset and time step, the
+A session file (``*.semscope.json``) records the dataset and time step, the
 field, colormap and range, the rendering options, the view extent, the
 pinned probe, the line probes, the boundaries and the field-calculator
 definitions.  The GUI saves and reloads them, and
 :func:`plotter_from_session` turns one into a matplotlib
-:class:`~semview.plotting.Plotter`, so a view composed interactively can be
+:class:`~semscope.plotting.Plotter`, so a view composed interactively can be
 reproduced as a publication figure.
 """
 
@@ -15,20 +15,30 @@ import datetime as _dt
 import json
 import os
 
-__all__ = ["SESSION_VERSION", "SESSION_SUFFIX", "load_session", "save_session", "plotter_from_session"]
+__all__ = ["SESSION_VERSION", "SESSION_SUFFIX", "SESSION_SUFFIXES", "is_session_file", "load_session", "save_session", "plotter_from_session"]
 
 SESSION_VERSION = 1
-SESSION_SUFFIX = ".semview.json"
+SESSION_SUFFIX = ".semscope.json"
+LEGACY_SUFFIX = ".semview.json"          # files written before the package was renamed
+SESSION_SUFFIXES = (SESSION_SUFFIX, LEGACY_SUFFIX)
+SESSION_KEYS = ("semscope_session", "semview_session")
+
+
+def is_session_file(path: str) -> bool:
+    return path.endswith(SESSION_SUFFIXES)
 
 
 def load_session(path: str) -> dict:
     """Read and validate a session file; the dataset path is made absolute."""
     with open(path) as fh:
         sess = json.load(fh)
-    if not isinstance(sess, dict) or "semview_session" not in sess:
-        raise ValueError(f"{path} is not a semview session file")
-    if int(sess["semview_session"]) > SESSION_VERSION:
-        raise ValueError(f"{path}: session version {sess['semview_session']} is newer than this semview")
+    key = next((k for k in SESSION_KEYS if isinstance(sess, dict) and k in sess), None)
+    if key is None:
+        raise ValueError(f"{path} is not a semscope session file")
+    if key != "semscope_session":
+        sess["semscope_session"] = sess.pop(key)
+    if int(sess["semscope_session"]) > SESSION_VERSION:
+        raise ValueError(f"{path}: session version {sess['semscope_session']} is newer than this semscope")
     ds = sess.setdefault("dataset", {})
     p = ds.get("path")
     if not p:
@@ -41,14 +51,15 @@ def load_session(path: str) -> dict:
 
 
 def save_session(path: str, session: dict, overwrite: bool = True) -> str:
-    """Write a session file (adds the ``.semview.json`` suffix if missing)."""
-    if not path.endswith(SESSION_SUFFIX):
+    """Write a session file (adds the ``.semscope.json`` suffix if missing)."""
+    if not path.endswith(SESSION_SUFFIXES):
         path = path + SESSION_SUFFIX if not path.endswith(".json") else path[: -len(".json")] + SESSION_SUFFIX
     if os.path.exists(path) and not overwrite:
         raise FileExistsError(path)
     session = dict(session)
     session.pop("_file", None)
-    session["semview_session"] = SESSION_VERSION
+    session.pop("semview_session", None)
+    session["semscope_session"] = SESSION_VERSION
     session.setdefault("saved", _dt.datetime.now().isoformat(timespec="seconds"))
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w") as fh:
@@ -57,10 +68,10 @@ def save_session(path: str, session: dict, overwrite: bool = True) -> str:
 
 
 def plotter_from_session(session, figsize=(9, 6), dpi=150, comm=None):
-    """Build a :class:`~semview.plotting.Plotter` reproducing a GUI session.
+    """Build a :class:`~semscope.plotting.Plotter` reproducing a GUI session.
 
     ``session`` is a path or an already loaded dict.  Returns the plotter and
-    the loaded :class:`~semview.dataset.SEMData2D` (``None`` on non-root MPI ranks).
+    the loaded :class:`~semscope.dataset.SEMData2D` (``None`` on non-root MPI ranks).
     """
     from .dataset import Dataset
     from .plotting import Plotter

@@ -3,9 +3,9 @@
 import numpy as np
 import pytest
 
-import semview
-from semview import calc, synthetic
-from semview.calc import ExpressionError
+import semscope
+from semscope import calc, synthetic
+from semscope.calc import ExpressionError
 
 
 @pytest.fixture
@@ -79,7 +79,7 @@ def test_free_names_and_help():
 def test_dataset_definitions_apply_to_all_steps(tmp_path, tg):
     path = str(tmp_path / "tg0.f00000")
     tg.write(path)
-    ds = semview.open(path)
+    ds = semscope.open(path)
     ds.define("w", "dx(v) - dy(u)")
     d = ds[0]
     assert d.available == ["u", "v", "p", "w"]

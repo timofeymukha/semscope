@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from semview import spectral as sp
+from semscope import spectral as sp
 
 
 @pytest.mark.parametrize("n", [2, 3, 5, 8, 12, 16])

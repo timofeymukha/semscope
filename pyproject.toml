@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "semview"
+name = "semscope"
 version = "0.1.0"
 description = "Spectral-element-aware visualization of 2D CG SEM data (Nek5000/Neko) with a scripting API and a WebGL GUI"
 readme = "README.md"
@@ -21,13 +21,13 @@ plot = ["matplotlib"]
 test = ["pytest", "matplotlib", "scipy"]
 
 [project.scripts]
-semview = "semview.cli:main"
+semscope = "semscope.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["semview*"]
+include = ["semscope*"]
 
 [tool.setuptools.package-data]
-"semview.gui" = ["static/*"]
+"semscope.gui" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

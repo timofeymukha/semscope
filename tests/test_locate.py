@@ -1,8 +1,8 @@
 import numpy as np
 
-from semview import spectral as sp
-from semview import synthetic
-from semview.locate import ElementLocator
+from semscope import spectral as sp
+from semscope import synthetic
+from semscope.locate import ElementLocator
 
 
 def _roundtrip(data, rng, npts=3000):

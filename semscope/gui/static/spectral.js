@@ -1,4 +1,4 @@
-// Small CPU-side spectral toolkit (mirrors semview/spectral.py) used for the
+// Small CPU-side spectral toolkit (mirrors semscope/spectral.py) used for the
 // hover probe: invert the geometry map by Newton iteration and evaluate the
 // field's Lagrange expansion at the exact cursor position.
 

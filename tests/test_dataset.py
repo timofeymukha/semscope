@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-import semview
-from semview import synthetic
+import semscope
+from semscope import synthetic
 
 
 def test_getitem_fields_and_expressions():
@@ -33,7 +33,7 @@ def test_resample_and_vertices():
 
 
 def test_read_mixlay(mixlay):
-    data = semview.load(mixlay)
+    data = semscope.load(mixlay)
     assert data.nelv == 1600 and data.n == 8
     assert data.field_names == ["u", "v", "p", "t", "s0", "s1"]
     assert abs(data.time - 148.752677327) < 1e-6
@@ -44,7 +44,7 @@ def test_read_mixlay(mixlay):
 
 
 def test_series_shares_mesh(flat_plate_meta):
-    ds = semview.open(flat_plate_meta)
+    ds = semscope.open(flat_plate_meta)
     assert len(ds) == 4
     assert ds.mesh.nelv == 187
     d3 = ds[3]
@@ -57,7 +57,7 @@ def test_series_shares_mesh(flat_plate_meta):
 def test_resolve_single_step_collects_siblings(flat_plate_meta):
     import os
 
-    from semview import io
+    from semscope import io
 
     step1 = os.path.join(os.path.dirname(flat_plate_meta), "flat_plate_2d0.f00001")
     series = io.resolve_files(step1)
@@ -70,7 +70,7 @@ def test_write_roundtrip(tmp_path):
     data = synthetic.taylor_green(synthetic.annulus(2, 6, 6))
     path = str(tmp_path / "tg0.f00000")
     data.write(path)
-    back = semview.load(path)
+    back = semscope.load(path)
     assert back.nelv == data.nelv and back.n == data.n
     assert np.allclose(back.x, data.x, atol=1e-6)
     assert np.allclose(back["u"], data["u"], atol=1e-6)
@@ -78,7 +78,7 @@ def test_write_roundtrip(tmp_path):
 
 
 def test_rejects_3d(tmp_path):
-    from semview import io
+    from semscope import io
 
     path = "/tmp/sa-flat-average-smoke.wMUkFV/field0.f00000"
     import os

@@ -11,18 +11,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-import semview  # noqa: E402
+import semscope  # noqa: E402
 
 path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/timofey/code/pySEMTools/examples/data/mixlay0.f00001"
 out = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(out, exist_ok=True)
 
-data = semview.load(path)
+data = semscope.load(path)
 print(data)
 
 # 1) full view: vorticity from the field calculator (spectrally exact derivatives) with the element mesh
 data.define("vorticity", "dx(v) - dy(u)")
-pl = semview.Plotter(figsize=(9, 6.3), dpi=130)
+pl = semscope.Plotter(figsize=(9, 6.3), dpi=130)
 pl.add_field(data, "vorticity", cmap="RdBu_r", clim=(-3, 3))
 pl.add_mesh(data, color="k", linewidth=0.25, alpha=0.5)
 pl.set_title(f"{data.name}: vorticity, t = {data.time:.2f}")
@@ -32,7 +32,7 @@ pl.save(os.path.join(out, "demo_vorticity.png"))
 # 2) zoom on a vortex: nodal (ParaView-like) vs spectral rendering
 fig, axs = plt.subplots(1, 2, figsize=(11, 4.6), dpi=130)
 for ax, method in zip(axs, ["nodal", "spectral"]):
-    p = semview.Plotter(ax=ax)
+    p = semscope.Plotter(ax=ax)
     p.add_field(data, "t", cmap="magma", method=method, colorbar=False)
     p.add_mesh(data, color="w", linewidth=0.6)
     p.add_nodes(data, color="cyan", size=4)

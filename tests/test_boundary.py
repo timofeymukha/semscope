@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from semview import synthetic
-from semview.boundary import Boundary, chain_edges, detect_boundaries, external_edges
+from semscope import synthetic
+from semscope.boundary import Boundary, chain_edges, detect_boundaries, external_edges
 
 
 def test_box_has_four_sides():
@@ -67,10 +67,10 @@ def test_chain_and_manual_boundary():
 def test_plotter_boundaries(tmp_path):
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg")
-    import semview
+    import semscope
 
     d = synthetic.taylor_green(synthetic.annulus(2, 12, 6))
-    pl = semview.Plotter(figsize=(4, 4), dpi=50)
+    pl = semscope.Plotter(figsize=(4, 4), dpi=50)
     pl.add_field(d, "u")
     pl.add_boundaries(d)
     pl.save(str(tmp_path / "b.png"))
@@ -87,14 +87,14 @@ def test_normal_line_and_mirrored_elements():
     assert abs(np.hypot(*p1) - 1.25) < 1e-9   # negative length goes outward
     # a mirrored mesh (negative Jacobian) must still give outward normals
     m = synthetic.box(3, 2, 5, xlim=(0, 1), ylim=(0, 1))
-    from semview.dataset import SEMData2D
-    from semview.boundary import edge_normals, jacobian_sign
+    from semscope.dataset import SEMData2D
+    from semscope.boundary import edge_normals, jacobian_sign
 
     mir = SEMData2D(-m.x, m.y, {}, name="mirrored")
     assert np.all(jacobian_sign(mir.x, mir.y, np.arange(mir.nelv)) == -1)
     ext = mir.external_edges()
     nrm = edge_normals(mir.x, mir.y, ext)
-    xe, ye = __import__("semview.boundary", fromlist=["edge_nodes"]).edge_nodes(mir.x, mir.y, ext[:, 0], ext[:, 1])
+    xe, ye = __import__("semscope.boundary", fromlist=["edge_nodes"]).edge_nodes(mir.x, mir.y, ext[:, 0], ext[:, 1])
     # outward: moving a little along the normal leaves the unit square [-1,0]x[0,1]
     px, py = xe + 1e-3 * nrm[..., 0], ye + 1e-3 * nrm[..., 1]
     outside = (px < -1) | (px > 0) | (py < 0) | (py > 1)
@@ -102,8 +102,8 @@ def test_normal_line_and_mirrored_elements():
 
 
 def test_normal_line_at_parametric():
-    from semview.boundary import edge_point
-    from semview import spectral as sp
+    from semscope.boundary import edge_point
+    from semscope import spectral as sp
 
     d = synthetic.annulus(2, 8, 6, r_in=0.5, r_out=1.0)
     outer = max(d.detect_boundaries(90), key=lambda b: b.length())
@@ -121,3 +121,44 @@ def test_normal_line_at_parametric():
         assert abs(nx * px + ny * py - 1.0) < 1e-5
         p0, p1 = outer.normal_line_at(3, t, 0.25)
         assert abs(np.hypot(*p1) - 0.75) < 1e-5
+
+
+def test_mixed_orientation_mesh_chains_and_orders():
+    """Meshes often mix positive and mirrored elements; boundaries must still chain into one loop."""
+    from semscope.boundary import chain_edges, jacobian_sign
+    from semscope.dataset import SEMData2D
+    from semscope.forces import compute_forces
+
+    box = synthetic.box(9, 4, 6, xlim=(0, 3), ylim=(0, 1))
+    x, y = box.x.copy(), box.y.copy()
+    flip = np.arange(box.nelv) % 3 != 1          # mirror two thirds of the elements (swap the r direction)
+    x[flip] = x[flip][:, :, ::-1]
+    y[flip] = y[flip][:, :, ::-1]
+    d = SEMData2D(x, y, {}, name="mixed")
+    assert set(jacobian_sign(d.x, d.y, np.arange(d.nelv))) == {-1.0, 1.0}
+    ext = d.external_edges()
+    assert len(ext) == 2 * (9 + 4)
+    loops = chain_edges(d.x, d.y, ext)
+    assert len(loops) == 1 and loops[0][1]       # one closed loop
+    sides = d.detect_boundaries(90)
+    assert len(sides) == 4 and sorted(len(b) for b in sides) == [4, 4, 9, 9]
+    for b in sides:
+        pl = b.polyline()                        # continuous: consecutive points are close
+        assert len(pl) == len(b) * (b.n - 1) + 1
+        assert np.all(np.hypot(*np.diff(pl, axis=0).T) < 0.4)
+        xe, ye = b.nodes()                       # traversal order: end of one edge = start of the next
+        assert np.allclose(xe[1:, 0], xe[:-1, -1]) and np.allclose(ye[1:, 0], ye[:-1, -1])
+        nrm = b.normals()
+        px, py = xe + 1e-3 * nrm[..., 0], ye + 1e-3 * nrm[..., 1]
+        assert np.all((px < 0) | (px > 3) | (py < 0) | (py > 1))   # outward
+    bottom = next(b for b in sides if np.allclose(b.nodes()[1], 0))
+    p0, p1 = bottom.normal_line(0, 0, 0.1)
+    assert abs(p0[0] - bottom.nodes()[0][0, 0]) < 1e-12 and abs(p1[1] - 0.1) < 1e-12
+    synthetic.add_analytic_field(d, "u", lambda x, y: y)
+    synthetic.add_analytic_field(d, "v", lambda x, y: 0 * x)
+    synthetic.add_analytic_field(d, "p", lambda x, y: x)
+    F = compute_forces(d, bottom)
+    s_ = F.distribution["s"]
+    assert np.all(np.diff(s_) > 0) and abs(s_[-1] - 3.0) < 1e-3
+    assert np.allclose(F.distribution["p"], F.distribution["x"], atol=1e-12)   # values follow the walk
+    assert np.allclose(F.viscous, [3.0, 0.0], atol=1e-10)

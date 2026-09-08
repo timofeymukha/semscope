@@ -7,7 +7,7 @@ It knows how to evaluate the spectral expansion anywhere (``sample``,
 (``resample``) and how to evaluate calculator expressions on the nodal
 data (``evaluate``/``define``) with spectrally exact derivatives.
 
-:class:`Dataset` wraps a :class:`~semview.io.Nek5000Series` and loads steps on
+:class:`Dataset` wraps a :class:`~semscope.io.Nek5000Series` and loads steps on
 demand, reusing the mesh of the first file for mesh-less steps (the usual
 Nek5000/Neko output layout).
 """
@@ -115,7 +115,7 @@ class SEMData2D:
 
         ``data["u"]`` returns the stored field, ``data["vort"]`` a field defined
         with :meth:`define`, and ``data["dx(v) - dy(u)"]`` evaluates the
-        expression on the fly (see :mod:`semview.calc` for the syntax).
+        expression on the fly (see :mod:`semscope.calc` for the syntax).
         """
         if name in self.fields:
             return self.fields[name]
@@ -171,7 +171,7 @@ class SEMData2D:
 
     # ------------------------------------------------------------ field calculator
     def evaluate(self, expr: str) -> np.ndarray:
-        """Evaluate a calculator expression (see :mod:`semview.calc`) at the GLL nodes."""
+        """Evaluate a calculator expression (see :mod:`semscope.calc`) at the GLL nodes."""
         return self._calc(expr, expr)
 
     def define(self, name: str, expr: str) -> str:
@@ -326,7 +326,7 @@ class SEMData2D:
         return detect_boundaries(self.x, self.y, angle=angle, edges=self.external_edges())
 
     def boundary(self, edges, name: str = "boundary"):
-        """A :class:`~semview.boundary.Boundary` from explicit ``(elem, side)`` pairs (chained if possible)."""
+        """A :class:`~semscope.boundary.Boundary` from explicit ``(elem, side)`` pairs (chained if possible)."""
         from .boundary import Boundary, chain_edges
 
         edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
@@ -339,7 +339,7 @@ class SEMData2D:
         return Boundary(name, edges, closed=closed, x=self.x, y=self.y)
 
     def normal_line(self, elem: int, side: int, node: int, length: float):
-        """Wall-normal probe segment ``(p0, p1)`` starting at a boundary GLL node (see :func:`semview.boundary.normal_line`)."""
+        """Wall-normal probe segment ``(p0, p1)`` starting at a boundary GLL node (see :func:`semscope.boundary.normal_line`)."""
         from .boundary import normal_line
 
         return normal_line(self.x, self.y, int(elem), int(side), int(node), float(length))
@@ -349,6 +349,18 @@ class SEMData2D:
         from .boundary import normal_line_at
 
         return normal_line_at(self.x, self.y, int(elem), int(side), float(t), float(length))
+
+    def forces(self, boundary, **kwargs):
+        """Forces and force coefficients on a boundary (see :func:`semscope.forces.compute_forces`).
+
+        ``boundary`` is a :class:`~semscope.boundary.Boundary` or ``(elem, side)``
+        pairs; keyword arguments select the velocity/pressure fields, the
+        material properties ``rho``/``mu`` (constants or fields), the projection
+        ``axes`` and the reference values ``U_ref``, ``L_ref``, ``p_ref``.
+        """
+        from .forces import compute_forces
+
+        return compute_forces(self, boundary, **kwargs)
 
     # ------------------------------------------------------------ MPI
     def gather(self, comm=None, root: int = 0) -> "SEMData2D | None":
@@ -374,7 +386,7 @@ class SEMData2D:
     def from_pysemtools(cls, msh, fld=None, name: str = "") -> "SEMData2D":
         """Build from pysemtools ``Mesh`` and ``FieldRegistry`` objects (2D, lz == 1)."""
         if msh.lz != 1:
-            raise ValueError("semview handles 2D data only (msh.lz must be 1)")
+            raise ValueError("semscope handles 2D data only (msh.lz must be 1)")
         fields = {}
         t = 0.0
         if fld is not None:

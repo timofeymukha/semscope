@@ -8,8 +8,8 @@ import urllib.request
 import numpy as np
 import pytest
 
-from semview import synthetic
-from semview.gui.server import DataService, browse, make_handler
+from semscope import synthetic
+from semscope.gui.server import DataService, browse, make_handler
 from http.server import ThreadingHTTPServer
 
 
@@ -48,7 +48,7 @@ def test_state_and_static(server):
     assert st["available"] == ["u", "v", "p"] and st["calc"] == [] and "sqrt" in st["calc_syntax"]["functions"]
     assert len(st["gll"]) == 6 and abs(st["gll"][0] + 1) < 1e-15
     html, hdr = get(base + "/")
-    assert b"<title>semview</title>" in html
+    assert b"<title>semscope</title>" in html
     for f in ("app.js", "renderer.js", "shaders.js", "spectral.js", "style.css"):
         body, hdr = get(base + "/" + f)
         assert len(body) > 100
@@ -181,3 +181,45 @@ def get_status(url):
             return r.status, r.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
+
+
+def test_forces_endpoint(server):
+    from semscope.boundary import edge_nodes
+    from semscope.forces import compute_forces
+
+    base, service = server
+    d = service.get_step(0)
+    ext = service._external()["edges"]
+    det = json.loads(get(base + "/api/boundary/detect?angle=90")[0])
+    groups = []
+    for g in det["groups"]:
+        e = ext[np.array(g["edges"])]
+        xe, ye = edge_nodes(d.x, d.y, e[:, 0], e[:, 1])
+        groups.append((float(np.hypot(xe, ye).mean()), g))
+    inner, outer = min(groups)[1], max(groups)[1]
+    body = {
+        "step": 0,
+        "boundaries": [{"name": "inner", "edges": inner["edges"]}, {"name": "outer", "edges": outer["edges"]}],
+        "u": "u", "v": "v", "w": "", "p": "p", "rho": 1.0, "mu": 0.01,
+        "axes": [{"name": "x", "dir": [1, 0]}, {"name": "y", "dir": [0, 1]}],
+        "U_ref": 1, "L_ref": 1, "p_ref": 0, "rho_ref": "",
+    }
+    status, out = post(base + "/api/forces", body)
+    assert status == 200 and [b["name"] for b in out["boundaries"]] == ["inner", "outer"]
+    assert abs(out["boundaries"][0]["length"] - np.pi) < 1e-6 and abs(out["total"]["length"] - 2 * np.pi * 2.0) < 1e-6
+    assert out["q"] == 0.5 and "dist" not in out["total"]
+    dist = out["boundaries"][0]["dist"]
+    assert len(dist["s"]) == len(dist["cp"]) == len(dist["cf"]) and dist["s"][0] == 0
+    F = compute_forces(d, ext[np.array(inner["edges"])], mu=0.01)
+    assert np.allclose(out["boundaries"][0]["pressure"], F.pressure) and np.allclose(out["boundaries"][0]["viscous"], F.viscous)
+    assert out["boundaries"][0]["axes"][0]["name"] == "x" and abs(out["boundaries"][0]["axes"][0]["coefficient"] - F.coefficient((1, 0))) < 1e-12
+    # a viscosity field and rotated axes
+    status, out2 = post(base + "/api/forces", dict(body, mu="p", axes=[{"name": "d", "dir": [1, 1]}, {"name": "l", "dir": [-1, 1]}]))
+    assert status == 200 and out2["boundaries"][0]["axes"][0]["name"] == "d"
+    assert abs(out2["boundaries"][0]["axes"][0]["total"] - (out2["boundaries"][0]["total"][0] + out2["boundaries"][0]["total"][1]) / np.sqrt(2)) < 1e-9
+    status, out = post(base + "/api/forces", dict(body, p="nope"))
+    assert status == 400
+    status, out = post(base + "/api/forces", dict(body, boundaries=[]))
+    assert status == 400
+    status, out = post(base + "/api/forces", dict(body, axes=[{"name": "a", "dir": [0, 0]}]))
+    assert status == 400
